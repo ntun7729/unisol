@@ -8,9 +8,10 @@ export async function loadStoredConfig(env) {
   if (cache.expires > now) return cache.value;
   try {
     const raw = await env.KV.get(KEY);
-    const value = raw ? JSON.parse(raw) : {};
-    cache = { expires: now + CACHE_MS, value: value && typeof value === 'object' ? value : {} };
-    return cache.value;
+    const parsed = raw ? JSON.parse(raw) : {};
+    const value = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? sanitizeStoredConfig(parsed) : {};
+    cache = { expires: now + CACHE_MS, value };
+    return value;
   } catch {
     cache = { expires: now + 5_000, value: {} };
     return {};
@@ -26,11 +27,11 @@ export async function saveStoredConfig(env, input) {
 }
 
 export function sanitizeStoredConfig(input) {
-  const source = input && typeof input === 'object' ? input : {};
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const allowed = [
     'uuid','path','trojanPassword','outbound','mode','proxyIp','preferred','routes',
-    'dialRace','firstByteTimeoutMs','enableWs','enableXhttp','blockPrivate','disableIpv6',
-    'allowPathOverride','rootMode','subscriptionName','uploadCoalesceBytes','uploadQueueBytes','downloadGrainBytes'
+    'dialRace','enableWs','enableXhttp','blockPrivate','disableIpv6','allowPathOverride',
+    'rootMode','subscriptionName','maxEarlyDataBytes','uploadCoalesceBytes','uploadQueueBytes','downloadGrainBytes'
   ];
   const out = {};
   for (const key of allowed) if (Object.prototype.hasOwnProperty.call(source, key)) out[key] = source[key];
