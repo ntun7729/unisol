@@ -16,8 +16,8 @@ export async function openOutbound({ host, port, initialData = new Uint8Array(0)
 
   const errors = [];
   for (const attempt of attempts) {
+    let socket;
     try {
-      let socket;
       if (attempt.kind === 'proxy') {
         socket = await connectViaProxy(connector, config.outbound, host, port, initialData);
       } else {
@@ -26,6 +26,7 @@ export async function openOutbound({ host, port, initialData = new Uint8Array(0)
       }
       return { socket, route: attempt };
     } catch (error) {
+      closeQuietly(socket);
       errors.push(`${attempt.label}: ${error?.message || error}`);
     }
   }
@@ -138,7 +139,7 @@ export async function httpConnect(connector, proxy, host, port, initialData = ne
       'Proxy-Connection: keep-alive',
       'User-Agent: Unisol/1'
     ];
-    if (proxy.username) lines.push(`Proxy-Authorization: Basic ${btoa(`${proxy.username}:${proxy.password || ''}`)}`);
+    if (proxy.username) lines.push(`Proxy-Authorization: Basic ${base64Utf8(`${proxy.username}:${proxy.password || ''}`)}`);
     lines.push('', '');
     await writer.write(encoder.encode(lines.join('\r\n')));
     const header = await buffered.readUntil(encoder.encode('\r\n\r\n'), 16 * 1024);
@@ -162,6 +163,15 @@ async function writeInitial(socket, initialData) {
   const writer = socket.writable.getWriter();
   try { await writer.write(initialData); }
   finally { try { writer.releaseLock(); } catch {} }
+}
+
+function base64Utf8(value) {
+  const bytes = encoder.encode(value);
+  let binary = '';
+  for (let offset = 0; offset < bytes.byteLength; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
 }
 
 export function formatAuthority(host, port) {
