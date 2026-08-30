@@ -153,7 +153,7 @@ export async function readProtocolHead(reader, parse, maxBytes = 64 * 1024) {
   while (buffer.byteLength <= maxBytes) {
     const parsed = parse(buffer);
     if (parsed.status === 'ok') return { parsed, reader };
-    if (parsed.status === 'error' && buffer.byteLength >= 60) throw new Error(parsed.error || 'invalid protocol request');
+    if (parsed.status === 'error') throw new Error(parsed.error || 'invalid protocol request');
     const { value, done } = await reader.read();
     if (done) throw new Error('request ended before protocol header completed');
     if (!value?.byteLength) continue;
