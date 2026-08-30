@@ -1,0 +1,9 @@
+name = "unisol"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+keep_vars = true
+
+# Optional KV binding for live configuration:
+# [[kv_namespaces]]
+# binding = "KV"
+# id = "YOUR_KV_NAMESPACE_ID"
