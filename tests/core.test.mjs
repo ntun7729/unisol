@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   applyConnectionOverrides,
   buildConfig,
+  isIpv6,
   isPrivateAddress,
   parseEndpoint,
   parseProxyUrl,
@@ -57,10 +58,15 @@ test('fixed control-plane routes remain reachable before UUID bootstrap', () => 
 });
 
 test('private and local destinations are identified', () => {
-  for (const host of ['127.0.0.1', '10.2.3.4', '172.16.5.1', '192.168.1.1', '169.254.1.1', 'localhost', 'localhost.', 'x.local', '::1', 'fd00::1']) {
-    assert.equal(isPrivateAddress(host), true, host);
+  for (const host of [
+    '127.0.0.1', '10.2.3.4', '172.16.5.1', '192.168.1.1', '169.254.1.1',
+    'localhost', 'localhost.', 'x.local', '::1', 'fd00::1', 'ff02::1', '::ffff:192.168.1.1'
+  ]) assert.equal(isPrivateAddress(host), true, host);
+
+  for (const host of ['1.1.1.1', '8.8.8.8', 'example.com', '2606:4700:4700::1111', '::ffff:8.8.8.8']) {
+    assert.equal(isPrivateAddress(host), false, host);
   }
-  for (const host of ['1.1.1.1', '8.8.8.8', 'example.com', '2606:4700:4700::1111']) assert.equal(isPrivateAddress(host), false, host);
+  assert.equal(isIpv6('2001:::1'), false);
 });
 
 test('buildConfig merges environment and stored values with validation', () => {
