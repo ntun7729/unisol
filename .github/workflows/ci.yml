@@ -54,7 +54,7 @@ jobs:
           ADMIN="ci-admin"
           EOF
 
-          npx wrangler dev --ip 127.0.0.1 --port 8787 > /tmp/unisol-wrangler.log 2>&1 &
+          npx wrangler dev --ip 127.0.0.1 --port 8787 --local-protocol https > /tmp/unisol-wrangler.log 2>&1 &
           WRANGLER_PID=$!
           cleanup() {
             kill "$WRANGLER_PID" 2>/dev/null || true
@@ -64,7 +64,7 @@ jobs:
 
           ready=0
           for _ in $(seq 1 80); do
-            if curl -fsS http://127.0.0.1:8787/health > /tmp/unisol-health.json 2>/dev/null; then
+            if curl -kfsS https://127.0.0.1:8787/health > /tmp/unisol-health.json 2>/dev/null; then
               ready=1
               break
             fi
@@ -77,19 +77,19 @@ jobs:
 
           grep -q '"ok": true' /tmp/unisol-health.json
           grep -q '"configured": true' /tmp/unisol-health.json
-          curl -fsS http://127.0.0.1:8787/ | grep -q 'Unisol Coffee'
-          curl -fsS http://127.0.0.1:8787/admin | grep -q 'Unisol Admin'
+          curl -kfsS https://127.0.0.1:8787/ | grep -q 'Unisol Coffee'
+          curl -kfsS https://127.0.0.1:8787/admin | grep -q 'Unisol Admin'
 
-          curl -fsS 'http://127.0.0.1:8787/90cd4a77/sub?format=plain' > /tmp/unisol-sub.txt
+          curl -kfsS 'https://127.0.0.1:8787/90cd4a77/sub?format=plain' > /tmp/unisol-sub.txt
           grep -q 'type=ws' /tmp/unisol-sub.txt
           grep -q 'type=xhttp' /tmp/unisol-sub.txt
 
-          code=$(curl -sS -o /tmp/unisol-unauth.txt -w '%{http_code}' http://127.0.0.1:8787/api/config)
+          code=$(curl -ksS -o /tmp/unisol-unauth.txt -w '%{http_code}' https://127.0.0.1:8787/api/config)
           test "$code" = "401"
-          curl -fsS -H 'Authorization: Bearer ci-admin' http://127.0.0.1:8787/api/config > /tmp/unisol-config.json
+          curl -kfsS -H 'Authorization: Bearer ci-admin' https://127.0.0.1:8787/api/config > /tmp/unisol-config.json
           grep -q '"kvEnabled": false' /tmp/unisol-config.json
 
-          code=$(curl -sS -o /tmp/unisol-xhttp.txt -w '%{http_code}' -X POST --data-binary 'bad' http://127.0.0.1:8787/90cd4a77/xhttp)
+          code=$(curl -ksS -o /tmp/unisol-xhttp.txt -w '%{http_code}' -X POST --data-binary 'bad' https://127.0.0.1:8787/90cd4a77/xhttp)
           test "$code" = "400"
 
           cleanup
