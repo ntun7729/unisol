@@ -8,6 +8,7 @@ import {
   parseProxyUrl,
   parseRoutes,
   resolvePolicy,
+  routeKind,
   wildcardMatch
 } from '../src/core.js';
 
@@ -18,6 +19,7 @@ test('parseEndpoint handles domains, IPv4, bracketed IPv6, and names', () => {
   assert.deepEqual(parseEndpoint('1.2.3.4:443'), { host: '1.2.3.4', port: 443, name: '1.2.3.4' });
   assert.deepEqual(parseEndpoint('[2606:4700:4700::1111]:2053#v6'), { host: '2606:4700:4700::1111', port: 2053, name: 'v6' });
   assert.deepEqual(parseEndpoint('2606:4700:4700::1111'), { host: '2606:4700:4700::1111', port: 443, name: '2606:4700:4700::1111' });
+  assert.deepEqual(parseEndpoint('edge.example:443#bad%zz'), { host: 'edge.example', port: 443, name: 'bad%zz' });
 });
 
 test('parseProxyUrl supports socks5/http/https and auth', () => {
@@ -27,6 +29,7 @@ test('parseProxyUrl supports socks5/http/https and auth', () => {
   assert.equal(parseProxyUrl('http://proxy.example').port, 80);
   assert.equal(parseProxyUrl('https://proxy.example').port, 443);
   assert.equal(parseProxyUrl('ftp://proxy.example'), null);
+  assert.equal(parseProxyUrl('socks5://bad%zz:pw@proxy.example:1080').username, 'bad%zz');
 });
 
 test('route patterns and policies are deterministic', () => {
@@ -40,8 +43,21 @@ test('route patterns and policies are deterministic', () => {
   assert.equal(resolvePolicy('other.test', config), 'proxy-first');
 });
 
+test('fixed control-plane routes remain reachable before UUID bootstrap', () => {
+  const unconfigured = buildConfig({ ADMIN: 'secret' }, {});
+  assert.equal(unconfigured.path, '');
+  assert.equal(routeKind('/health', unconfigured).kind, 'health');
+  assert.equal(routeKind('/admin', unconfigured).kind, 'admin');
+  assert.equal(routeKind('/api/config', unconfigured).kind, 'config-api');
+  assert.equal(routeKind('/anything', unconfigured).kind, 'invalid');
+
+  const configured = buildConfig({ UUID }, {});
+  assert.equal(routeKind(`/${configured.path}/ws`, configured).kind, 'ws');
+  assert.equal(routeKind(`/sub/${configured.path}`, configured).kind, 'sub');
+});
+
 test('private and local destinations are identified', () => {
-  for (const host of ['127.0.0.1', '10.2.3.4', '172.16.5.1', '192.168.1.1', '169.254.1.1', 'localhost', 'x.local', '::1', 'fd00::1']) {
+  for (const host of ['127.0.0.1', '10.2.3.4', '172.16.5.1', '192.168.1.1', '169.254.1.1', 'localhost', 'localhost.', 'x.local', '::1', 'fd00::1']) {
     assert.equal(isPrivateAddress(host), true, host);
   }
   for (const host of ['1.1.1.1', '8.8.8.8', 'example.com', '2606:4700:4700::1111']) assert.equal(isPrivateAddress(host), false, host);
