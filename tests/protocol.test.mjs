@@ -54,6 +54,19 @@ test('SHA-224 implementation matches Node crypto', () => {
   }
 });
 
+test('SOCKS address encoding validates IP literals', () => {
+  const v4 = encodeSocksAddress('1.2.3.4', 443);
+  assert.deepEqual([...v4.subarray(0, 5)], [1,1,2,3,4]);
+
+  const v6 = encodeSocksAddress('::ffff:192.168.1.1', 443);
+  assert.equal(v6[0], 4);
+  assert.deepEqual([...v6.subarray(1, 17)], [0,0,0,0,0,0,0,0,0,0,255,255,192,168,1,1]);
+
+  const numericHostname = encodeSocksAddress('999.1.1.1', 80);
+  assert.equal(numericHostname[0], 3);
+  assert.throws(() => encodeSocksAddress('2001:::1', 443), /invalid IPv6 address/);
+});
+
 test('Trojan TCP parses authentication, address, port, and payload', () => {
   const password = 'super-secret';
   const auth = encoder.encode(createHash('sha224').update(password).digest('hex'));
