@@ -193,20 +193,50 @@ export function isIpv4(host) {
   return parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255);
 }
 
+export function normalizeIpv6(host) {
+  const text = String(host || '').trim().replace(/^\[(.*)\]$/, '$1');
+  if (!text.includes(':') || text.includes('%')) return '';
+  try {
+    const hostname = new URL(`http://[${text}]/`).hostname;
+    return hostname.replace(/^\[(.*)\]$/, '$1').toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
 export function isIpv6(host) {
-  const text = String(host || '').replace(/^\[(.*)\]$/, '$1');
-  return text.includes(':') && /^[0-9a-f:.]+$/i.test(text);
+  return Boolean(normalizeIpv6(host));
+}
+
+function isPrivateIpv4(host) {
+  if (!isIpv4(host)) return false;
+  const [a, b] = host.split('.').map(Number);
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+}
+
+function mappedIpv4(normalizedIpv6) {
+  const match = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(normalizedIpv6);
+  if (!match) return '';
+  const hi = Number.parseInt(match[1], 16);
+  const lo = Number.parseInt(match[2], 16);
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
 }
 
 export function isPrivateAddress(host) {
   const text = String(host || '').toLowerCase().replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '');
-  if (isIpv4(text)) {
-    const [a, b] = text.split('.').map(Number);
-    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+  if (isPrivateIpv4(text)) return true;
+
+  const v6 = normalizeIpv6(text);
+  if (v6) {
+    if (v6 === '::' || v6 === '::1') return true;
+    if (v6.startsWith('fc') || v6.startsWith('fd')) return true;
+    if (/^fe[89ab]/.test(v6)) return true;
+    if (v6.startsWith('ff')) return true;
+    const mapped = mappedIpv4(v6);
+    if (mapped && isPrivateIpv4(mapped)) return true;
+    return false;
   }
-  if (isIpv6(text)) {
-    return text === '::' || text === '::1' || text.startsWith('fc') || text.startsWith('fd') || text.startsWith('fe8') || text.startsWith('fe9') || text.startsWith('fea') || text.startsWith('feb');
-  }
+
   return text === 'localhost' || text.endsWith('.localhost') || text.endsWith('.local');
 }
 
