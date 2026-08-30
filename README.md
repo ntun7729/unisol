@@ -19,7 +19,7 @@ The project keeps the parts that are useful in production—bounded streaming, p
 - Per-domain routing rules
 - `proxy-first`, `direct-first`, `proxy-only`, and `direct` outbound modes
 - Optional IPv6-disable policy
-- Private/local destination blocking by default
+- Literal private/local destination filtering by default
 - Optional per-connection outbound overrides
 - KV-backed live configuration and an `/admin` interface
 - Raw/Base64, Clash, and Sing-box subscription output
@@ -43,11 +43,13 @@ This structure is intentional. The transport code does not need to know how a SO
 
 ## Required configuration
 
-At minimum, set a valid UUIDv4:
+The tunnel needs a valid UUIDv4. It can be supplied directly as a Worker variable:
 
 ```text
 UUID=90cd4a77-141a-43c9-991b-08263cfe9c10
 ```
+
+Or, if you want to bootstrap through the admin interface, set `ADMIN`, bind KV, then use `/admin` to save the UUID. The fixed control-plane routes `/health`, `/admin`, and `/api/config` remain reachable before a UUID exists.
 
 Recommended for the live admin interface:
 
@@ -61,7 +63,7 @@ Bind a Cloudflare KV namespace as `KV` if you want settings changed in `/admin` 
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `UUID` | required | VLESS user and the base identity for the deployment; UUIDv4 only |
+| `UUID` | required for tunnel traffic | VLESS user and the base identity for the deployment; UUIDv4 only |
 | `ADMIN` | empty | Password used as a Bearer token by `/api/config`; enables `/admin` |
 | `PATH` | first 8 UUID chars | Ingress/subscription path prefix |
 | `TROJAN_PASSWORD` | empty | Enables Trojan when set |
@@ -73,7 +75,7 @@ Bind a Cloudflare KV namespace as `KV` if you want settings changed in `/admin` 
 | `DIAL_RACE` | `2` | Number of parallel direct connection attempts, 1–4 |
 | `ENABLE_WS` | `true` | Enable WebSocket ingress |
 | `ENABLE_XHTTP` | `true` | Enable XHTTP ingress |
-| `BLOCK_PRIVATE` | `true` | Reject localhost/private/link-local target addresses |
+| `BLOCK_PRIVATE` | `true` | Reject literal localhost/private/link-local targets and local names |
 | `DISABLE_IPV6` | `false` | Reject IPv6 destinations and omit IPv6 preferred nodes |
 | `ALLOW_PATH_OVERRIDE` | `false` | Allow connection query parameters to override outbound settings |
 | `MAX_EARLY_DATA` | `8192` | Maximum WebSocket early-data bytes |
@@ -82,6 +84,8 @@ Bind a Cloudflare KV namespace as `KV` if you want settings changed in `/admin` 
 | `DOWNLOAD_GRAIN` | `32768` | Maximum downstream aggregation target |
 | `SUB_NAME` | `Unisol` | Subscription node-name prefix |
 | `ROOT_MODE` | `cafe` | Use `404` to hide the root page |
+
+`BLOCK_PRIVATE` validates literal IPv4/IPv6 targets, IPv4-mapped IPv6 targets, localhost/local names, multicast, link-local, RFC1918, CGNAT, and IPv6 local ranges before dialing. It does not pre-resolve arbitrary DNS names, so it is not a DNS-rebinding firewall.
 
 Endpoint examples:
 
@@ -206,10 +210,11 @@ Responses are converted back to VLESS UDP framing. Trojan UDP and non-DNS UDP ar
 3. Set `ADMIN` to a strong value.
 4. Open `/admin`.
 5. Enter the admin password when prompted.
+6. Save a valid UUID and any other desired settings.
 
-The browser stores the password only in `sessionStorage` and sends it to `/api/config` in the `Authorization: Bearer ...` header. `ADMIN` itself is not writable through the KV API.
+The browser stores the password only in `sessionStorage` and sends it to `/api/config` in the `Authorization: Bearer ...` header. `ADMIN` itself is not writable through the KV API and is never included in the persisted configuration allowlist.
 
-KV configuration is cached in the Worker isolate for 30 seconds. A successful save updates the current isolate cache immediately.
+KV configuration is cached in the Worker isolate for 30 seconds. A successful save updates the current isolate cache immediately. Admin POSTs behave as patches so omitted stored settings are preserved.
 
 ## Deploy with Wrangler
 
@@ -228,14 +233,16 @@ npx wrangler secret put ADMIN
 
 The included `wrangler.toml` points directly to `src/index.js`, so Wrangler can deploy the modular source tree without requiring the bundled artifact.
 
-## Build a single `_worker.js`
+## Build and verify locally
 
 ```bash
 npm install
 npm run check
 ```
 
-The bundle is written to:
+`npm run check` runs the unit suite, builds the standalone Worker, and performs `wrangler deploy --dry-run` against the modular Worker source.
+
+The standalone bundle is written to:
 
 ```text
 dist/_worker.js
@@ -245,24 +252,27 @@ That file keeps `cloudflare:sockets` as a Worker runtime import and can be used 
 
 ## GitHub Actions verification
 
-`.github/workflows/ci.yml` runs on every push and pull request. It:
+`.github/workflows/ci.yml` runs on pushes, pull requests, and manual dispatch. Superseded runs on the same ref are cancelled. The workflow:
 
 1. parses every source and test file with `node --check`;
 2. runs the Node unit tests;
 3. bundles the Worker with esbuild;
-4. verifies that the output exists and retains the Cloudflare socket runtime import;
-5. uploads the built `_worker.js` as a workflow artifact.
+4. runs a Cloudflare Wrangler deployment dry-run;
+5. boots the Worker under local `wrangler dev`/workerd and smoke-tests root, health, admin, authenticated/unauthenticated config API, subscription generation, and malformed XHTTP handling;
+6. verifies that the standalone output exists and retains the Cloudflare socket runtime import;
+7. uploads the built `_worker.js` as a workflow artifact.
 
-The unit suite covers configuration, route matching, UUID/auth parsing, VLESS, Trojan/SHA-224, SOCKS5, HTTP CONNECT, HTTPS CONNECT, proxy response segmentation, bounded queueing, DNS framing/DoH, and subscription generation.
+The unit suite covers configuration, bootstrap routing, KV persistence/sanitization, route matching, UUID/auth parsing, VLESS, Trojan/SHA-224, IPv4/IPv6 target handling, SOCKS5, HTTP CONNECT, HTTPS CONNECT, segmented proxy responses, bounded queueing, malformed stream headers, DNS framing/DoH, and subscription generation.
 
 ## Security defaults
 
 Unisol intentionally defaults to a narrower security posture:
 
-- localhost, RFC1918, link-local, carrier-grade NAT, local names, and IPv6 local ranges are blocked as destinations;
+- literal localhost, RFC1918, link-local, carrier-grade NAT, mapped-private IPv6, multicast, local names, and IPv6 local ranges are blocked as destinations;
 - connection-level outbound overrides are disabled;
 - `proxy-only` never falls back to direct;
 - admin writes require a Bearer token and KV binding;
+- admin credentials are never persisted to KV;
 - malformed protocol frames are rejected before outbound dialing;
 - WebSocket early data and upload buffers are bounded;
 - invalid UDP types are rejected rather than guessed.
@@ -283,8 +293,8 @@ The two upstream projects demonstrated several useful engineering patterns: prot
 - explicit routing policy objects rather than transport-specific global state;
 - one outbound interface shared by WS and XHTTP;
 - generic SOCKS/HTTP(S) proxy handshakes with preserved buffered bytes;
-- strict target filtering before dial;
+- strict literal-target filtering before dial;
 - dedicated DNS framing rather than treating UDP payloads as TCP;
-- CI as a required build/test path.
+- CI that validates unit behavior, Cloudflare bundling, and a local Workers runtime smoke path.
 
 The goal is not to reproduce either upstream project feature-for-feature. It is to provide a smaller foundation that is easier to reason about and extend safely.
