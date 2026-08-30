@@ -1,4 +1,4 @@
-import { concatBytes, equalBytes } from './core.js';
+import { concatBytes, equalBytes, isIpv4, normalizeIpv6 } from './core.js';
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -128,37 +128,40 @@ export function ipv6FromBytes(bytes) {
 
 export function encodeSocksAddress(host, port) {
   let address;
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+  if (isIpv4(host)) {
     address = new Uint8Array([1, ...host.split('.').map(Number)]);
-  } else if (host.includes(':')) {
-    const groups = expandIpv6(host);
-    address = new Uint8Array(1 + 16);
-    address[0] = 4;
-    groups.forEach((group, index) => {
-      address[1 + index * 2] = group >> 8;
-      address[2 + index * 2] = group & 255;
-    });
   } else {
-    const name = encoder.encode(host);
-    if (name.byteLength > 255) throw new Error('hostname too long');
-    address = new Uint8Array([3, name.byteLength, ...name]);
+    const normalizedV6 = normalizeIpv6(host);
+    if (normalizedV6) {
+      const groups = expandIpv6(normalizedV6);
+      address = new Uint8Array(1 + 16);
+      address[0] = 4;
+      groups.forEach((group, index) => {
+        address[1 + index * 2] = group >> 8;
+        address[2 + index * 2] = group & 255;
+      });
+    } else {
+      if (host.includes(':')) throw new Error('invalid IPv6 address');
+      const name = encoder.encode(host);
+      if (!name.byteLength || name.byteLength > 255) throw new Error('hostname length invalid');
+      address = new Uint8Array([3, name.byteLength, ...name]);
+    }
   }
   return concatBytes(address, new Uint8Array([port >> 8, port & 255]));
 }
 
 function expandIpv6(host) {
-  host = host.replace(/^\[(.*)\]$/, '$1').toLowerCase();
   const [leftRaw, rightRaw = ''] = host.split('::');
   const left = leftRaw ? leftRaw.split(':') : [];
   const right = rightRaw ? rightRaw.split(':') : [];
   if (!host.includes('::') && left.length !== 8) throw new Error('invalid IPv6 address');
   const missing = 8 - left.length - right.length;
-  if (missing < 0) throw new Error('invalid IPv6 address');
+  if (missing < 0 || (host.includes('::') && missing < 1)) throw new Error('invalid IPv6 address');
   const all = [...left, ...Array(missing).fill('0'), ...right];
   if (all.length !== 8) throw new Error('invalid IPv6 address');
   return all.map(part => {
     const n = Number.parseInt(part || '0', 16);
-    if (!Number.isInteger(n) || n < 0 || n > 0xffff) throw new Error('invalid IPv6 address');
+    if (!/^[0-9a-f]{1,4}$/i.test(part || '0') || !Number.isInteger(n) || n < 0 || n > 0xffff) throw new Error('invalid IPv6 address');
     return n;
   });
 }
@@ -200,7 +203,7 @@ export function sha224(message) {
     0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
     0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
     0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0xa2bfe8a1,0xa81b70,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
     0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
   ];
