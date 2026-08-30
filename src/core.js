@@ -3,7 +3,6 @@ export const VERSION = '0.1.0';
 export const DEFAULTS = Object.freeze({
   mode: 'proxy-first',
   dialRace: 2,
-  firstByteTimeoutMs: 3500,
   maxEarlyDataBytes: 8192,
   uploadCoalesceBytes: 16 * 1024,
   uploadQueueBytes: 4 * 1024 * 1024,
@@ -64,11 +63,16 @@ export function equalBytes(a, b) {
   return diff === 0;
 }
 
+export function safeDecode(value) {
+  try { return decodeURIComponent(String(value || '')); }
+  catch { return String(value || ''); }
+}
+
 export function parseEndpoint(input, defaultPort = 443) {
   let text = String(input || '').trim();
   if (!text) return null;
   const hashAt = text.indexOf('#');
-  const name = hashAt >= 0 ? decodeURIComponent(text.slice(hashAt + 1).trim()) : '';
+  const name = hashAt >= 0 ? safeDecode(text.slice(hashAt + 1).trim()) : '';
   if (hashAt >= 0) text = text.slice(0, hashAt).trim();
   if (!text) return null;
 
@@ -131,8 +135,8 @@ export function parseProxyUrl(input) {
     scheme,
     host: url.hostname.replace(/^\[(.*)\]$/, '$1'),
     port,
-    username: decodeURIComponent(url.username || ''),
-    password: decodeURIComponent(url.password || '')
+    username: safeDecode(url.username || ''),
+    password: safeDecode(url.password || '')
   };
 }
 
@@ -195,7 +199,7 @@ export function isIpv6(host) {
 }
 
 export function isPrivateAddress(host) {
-  const text = String(host || '').toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  const text = String(host || '').toLowerCase().replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '');
   if (isIpv4(text)) {
     const [a, b] = text.split('.').map(Number);
     return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
@@ -223,7 +227,7 @@ export function buildConfig(env = {}, stored = {}) {
   const path = sanitizePath(stored.path ?? stored.PATH ?? env.PATH, uuid ? uuid.slice(0, 8) : '');
   const outboundRaw = stored.outbound ?? stored.OUTBOUND ?? env.OUTBOUND ?? env.PROXY ?? env.SOCKS5 ?? '';
   const mode = normalizePolicy(stored.mode ?? stored.MODE ?? env.MODE) || DEFAULTS.mode;
-  const config = {
+  return {
     uuid,
     uuidBytes: uuid ? uuidToBytes(uuid) : null,
     trojanPassword: String(stored.trojanPassword ?? stored.TROJAN_PASSWORD ?? env.TROJAN_PASSWORD ?? '').trim(),
@@ -236,7 +240,6 @@ export function buildConfig(env = {}, stored = {}) {
     preferred: parsePreferredList(stored.preferred ?? stored.PREFERRED ?? env.PREFERRED ?? ''),
     routes: parseRoutes(stored.routes ?? stored.ROUTES ?? env.ROUTES ?? ''),
     dialRace: intValue(stored.dialRace ?? env.DIAL_RACE, DEFAULTS.dialRace, 1, 4),
-    firstByteTimeoutMs: intValue(stored.firstByteTimeoutMs ?? env.FIRST_BYTE_TIMEOUT, DEFAULTS.firstByteTimeoutMs, 500, 15000),
     maxEarlyDataBytes: intValue(stored.maxEarlyDataBytes ?? env.MAX_EARLY_DATA, DEFAULTS.maxEarlyDataBytes, 0, 16384),
     uploadCoalesceBytes: intValue(stored.uploadCoalesceBytes ?? env.UPLOAD_COALESCE, DEFAULTS.uploadCoalesceBytes, 1024, 65536),
     uploadQueueBytes: intValue(stored.uploadQueueBytes ?? env.UPLOAD_QUEUE, DEFAULTS.uploadQueueBytes, 64 * 1024, 16 * 1024 * 1024),
@@ -249,7 +252,6 @@ export function buildConfig(env = {}, stored = {}) {
     rootMode: String(stored.rootMode ?? env.ROOT_MODE ?? DEFAULTS.rootMode).trim().toLowerCase(),
     subscriptionName: String(stored.subscriptionName ?? env.SUB_NAME ?? 'Unisol').trim() || 'Unisol'
   };
-  return config;
 }
 
 export function applyConnectionOverrides(config, url) {
@@ -291,7 +293,6 @@ export function safeConfigView(config) {
     preferred: config.preferred,
     routes: config.routes,
     dialRace: config.dialRace,
-    firstByteTimeoutMs: config.firstByteTimeoutMs,
     enableWs: config.enableWs,
     enableXhttp: config.enableXhttp,
     blockPrivate: config.blockPrivate,
