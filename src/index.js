@@ -1,5 +1,5 @@
 import { connect } from 'cloudflare:sockets';
-import { applyConnectionOverrides, buildConfig, routeKind, VERSION } from './core.js';
+import { applyConnectionOverrides, buildConfig, normalizePolicy, routeKind, VERSION } from './core.js';
 import { handleWebSocket, handleXhttp } from './session.js';
 import { renderSubscription } from './subscription.js';
 import { loadStoredConfig, sanitizeStoredConfig, saveStoredConfig } from './store.js';
@@ -16,15 +16,14 @@ export default {
         return Response.redirect(url.toString(), 301);
       }
 
-      // Root camouflage is intentionally cheap and does not read KV.
+      const stored = await loadStoredConfig(env);
+      const config = buildConfig(env, stored);
+
       if (url.pathname === '/' && request.method === 'GET') {
-        const envConfig = buildConfig(env, {});
-        if (envConfig.rootMode === '404') return new Response('Not Found', { status: 404 });
+        if (config.rootMode === '404') return new Response('Not Found', { status: 404 });
         return html(cafePage());
       }
 
-      const stored = await loadStoredConfig(env);
-      const config = buildConfig(env, stored);
       const route = routeKind(url.pathname, config);
 
       if (route.kind === 'health' && request.method === 'GET') {
@@ -43,7 +42,7 @@ export default {
         return html(adminPage(), { 'Cache-Control': 'no-store' });
       }
 
-      if (route.kind === 'config-api') return handleConfigApi(request, env, config);
+      if (route.kind === 'config-api') return handleConfigApi(request, env, config, stored);
 
       if (!config.uuid) {
         if (route.kind === 'sub' || route.kind === 'ws' || route.kind === 'xhttp') {
@@ -68,12 +67,16 @@ export default {
       if (route.kind === 'ws') {
         const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
         if (!config.enableWs || upgrade !== 'websocket') return new Response('Not Found', { status: 404 });
-        return handleWebSocket(request, applyConnectionOverrides(config, url), connect);
+        const connectionConfig = applyConnectionOverrides(config, url);
+        if (connectionConfig.outboundRaw && !connectionConfig.outbound) return new Response('Invalid outbound proxy', { status: 400 });
+        return handleWebSocket(request, connectionConfig, connect);
       }
 
       if (route.kind === 'xhttp') {
         if (!config.enableXhttp || request.method !== 'POST') return new Response('Not Found', { status: 404 });
-        return handleXhttp(request, applyConnectionOverrides(config, url), connect, ctx);
+        const connectionConfig = applyConnectionOverrides(config, url);
+        if (connectionConfig.outboundRaw && !connectionConfig.outbound) return new Response('Invalid outbound proxy', { status: 400 });
+        return handleXhttp(request, connectionConfig, connect, ctx);
       }
 
       return new Response('Not Found', { status: 404 });
@@ -84,7 +87,7 @@ export default {
   }
 };
 
-async function handleConfigApi(request, env, config) {
+async function handleConfigApi(request, env, config, stored) {
   if (!isAdminAuthorized(request, config.admin)) {
     return new Response('Unauthorized', {
       status: 401,
@@ -105,14 +108,25 @@ async function handleConfigApi(request, env, config) {
     const text = await request.text();
     if (text.length > 64 * 1024) return json({ error: 'configuration payload too large' }, 413);
     payload = JSON.parse(text || '{}');
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return json({ error: 'configuration must be a JSON object' }, 400);
   } catch {
     return json({ error: 'invalid JSON' }, 400);
   }
 
   try {
-    const candidate = sanitizeStoredConfig(payload);
+    if (Object.prototype.hasOwnProperty.call(payload, 'mode')) {
+      const rawMode = String(payload.mode ?? '').trim();
+      if (rawMode && !normalizePolicy(rawMode)) return json({ error: 'invalid outbound mode' }, 400);
+    }
+
+    const candidate = {
+      ...sanitizeStoredConfig(stored),
+      ...sanitizeStoredConfig(payload)
+    };
     const next = buildConfig(env, candidate);
     if (!next.uuid) return json({ error: 'UUID must be a valid UUIDv4' }, 400);
+    if (next.outboundRaw && !next.outbound) return json({ error: 'invalid outbound proxy URL' }, 400);
+
     await saveStoredConfig(env, candidate);
     return json(configApiResponse(next, true));
   } catch (error) {
