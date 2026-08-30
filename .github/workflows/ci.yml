@@ -39,11 +39,15 @@ jobs:
       - name: Bundle Worker
         run: npm run build
 
+      - name: Cloudflare dry run
+        run: npm run cf:dry-run
+
       - name: Verify bundle
         run: |
           test -s dist/_worker.js
           grep -q "cloudflare:sockets" dist/_worker.js
           wc -c dist/_worker.js
+          find dist/wrangler -type f -maxdepth 2 -print
 
       - name: Upload Worker bundle
         uses: actions/upload-artifact@v4
