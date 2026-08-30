@@ -42,12 +42,61 @@ jobs:
       - name: Cloudflare dry run
         run: npm run cf:dry-run
 
+      - name: Local Workers runtime smoke test
+        shell: bash
+        run: |
+          cat > .dev.vars <<'EOF'
+          UUID="90cd4a77-141a-43c9-991b-08263cfe9c10"
+          ADMIN="ci-admin"
+          EOF
+
+          npx wrangler dev --ip 127.0.0.1 --port 8787 > /tmp/unisol-wrangler.log 2>&1 &
+          WRANGLER_PID=$!
+          cleanup() {
+            kill "$WRANGLER_PID" 2>/dev/null || true
+            wait "$WRANGLER_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in $(seq 1 80); do
+            if curl -fsS http://127.0.0.1:8787/health > /tmp/unisol-health.json 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$ready" != "1" ]; then
+            cat /tmp/unisol-wrangler.log
+            exit 1
+          fi
+
+          grep -q '"ok": true' /tmp/unisol-health.json
+          grep -q '"configured": true' /tmp/unisol-health.json
+          curl -fsS http://127.0.0.1:8787/ | grep -q 'Unisol Coffee'
+          curl -fsS http://127.0.0.1:8787/admin | grep -q 'Unisol Admin'
+
+          curl -fsS 'http://127.0.0.1:8787/90cd4a77/sub?format=plain' > /tmp/unisol-sub.txt
+          grep -q 'type=ws' /tmp/unisol-sub.txt
+          grep -q 'type=xhttp' /tmp/unisol-sub.txt
+
+          code=$(curl -sS -o /tmp/unisol-unauth.txt -w '%{http_code}' http://127.0.0.1:8787/api/config)
+          test "$code" = "401"
+          curl -fsS -H 'Authorization: Bearer ci-admin' http://127.0.0.1:8787/api/config > /tmp/unisol-config.json
+          grep -q '"kvEnabled": false' /tmp/unisol-config.json
+
+          code=$(curl -sS -o /tmp/unisol-xhttp.txt -w '%{http_code}' -X POST --data-binary 'bad' http://127.0.0.1:8787/90cd4a77/xhttp)
+          test "$code" = "400"
+
+          cleanup
+          trap - EXIT
+
       - name: Verify bundle
         run: |
           test -s dist/_worker.js
           grep -q "cloudflare:sockets" dist/_worker.js
           wc -c dist/_worker.js
-          find dist/wrangler -type f -maxdepth 2 -print
+          find dist/wrangler -maxdepth 2 -type f -print
 
       - name: Upload Worker bundle
         uses: actions/upload-artifact@v4
