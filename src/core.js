@@ -270,14 +270,15 @@ export function applyConnectionOverrides(config, url) {
 
 export function routeKind(pathname, config) {
   const path = pathname.replace(/^\/+|\/+$/g, '');
+  if (path === 'health') return { kind: 'health' };
+  if (path === 'admin') return { kind: 'admin' };
+  if (path === 'api/config') return { kind: 'config-api' };
+
   const prefix = config.path;
   if (!prefix) return { kind: 'invalid' };
   if (path === `${prefix}/ws` || path === prefix) return { kind: 'ws' };
   if (path === `${prefix}/xhttp`) return { kind: 'xhttp' };
   if (path === `sub/${prefix}` || path === `${prefix}/sub`) return { kind: 'sub' };
-  if (path === 'health') return { kind: 'health' };
-  if (path === 'admin') return { kind: 'admin' };
-  if (path === 'api/config') return { kind: 'config-api' };
   return { kind: 'other' };
 }
 
