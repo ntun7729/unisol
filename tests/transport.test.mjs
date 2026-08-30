@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CoalescingWriter, GrainSender, responseReadable } from '../src/transport.js';
+import { CoalescingWriter, GrainSender, readProtocolHead, responseReadable } from '../src/transport.js';
 
 async function collectReadable(stream) {
   const reader = stream.getReader();
@@ -46,6 +46,20 @@ test('GrainSender preserves ordering', async () => {
   grain.push(new Uint8Array([4,5]));
   await grain.finish();
   assert.deepEqual([...sent.flatMap(x => [...x])], [1,2,3,4,5]);
+});
+
+test('readProtocolHead rejects parser errors without waiting for arbitrary extra bytes', async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array([1]));
+      controller.close();
+    }
+  });
+  const reader = stream.getReader();
+  await assert.rejects(
+    () => readProtocolHead(reader, buffer => buffer.byteLength ? { status: 'error', error: 'bad header' } : { status: 'need-more' }),
+    /bad header/
+  );
 });
 
 test('responseReadable emits protocol header before remote data', async () => {
