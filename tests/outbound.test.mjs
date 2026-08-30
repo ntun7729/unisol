@@ -106,6 +106,35 @@ test('openOutbound blocks private and disabled IPv6 destinations before dialing'
   await assert.rejects(() => openOutbound({ host: '::1', port: 80, config: { ...config, blockPrivate: false, disableIpv6: true }, connector: () => { throw new Error('must not dial'); } }), /IPv6 destination disabled/);
 });
 
+test('openOutbound closes a failed direct socket before trying fallback', async () => {
+  const bad = scriptedSocket(async () => { throw new Error('write failed'); });
+  const good = scriptedSocket(async () => []);
+  const addresses = [];
+  const connector = address => {
+    addresses.push(address);
+    return addresses.length === 1 ? bad : good;
+  };
+  const config = {
+    blockPrivate: false,
+    disableIpv6: false,
+    mode: 'direct',
+    routes: [],
+    proxyIp: [{ host: 'fallback.example', port: 443 }],
+    outbound: null,
+    dialRace: 1
+  };
+  const result = await openOutbound({
+    host: 'target.example',
+    port: 443,
+    initialData: new Uint8Array([1,2,3]),
+    config,
+    connector
+  });
+  assert.equal(bad.wasClosed, true);
+  assert.equal(result.route.host, 'fallback.example');
+  assert.deepEqual([...good.writes[0]], [1,2,3]);
+});
+
 test('IPv6 HTTP CONNECT authority is bracketed', () => {
   assert.equal(formatAuthority('2606:4700::1111', 443), '[2606:4700::1111]:443');
   assert.equal(formatAuthority('example.com', 443), 'example.com:443');
