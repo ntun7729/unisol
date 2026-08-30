@@ -227,6 +227,7 @@ function indexOfBytes(haystack, needle) {
 export function wrapReadablePrefix(socket, prefix) {
   const original = socket.readable;
   let sent = false;
+  let reader;
   const readable = new ReadableStream({
     async pull(controller) {
       if (!sent) {
@@ -234,14 +235,20 @@ export function wrapReadablePrefix(socket, prefix) {
         controller.enqueue(prefix);
         return;
       }
-      if (!this.reader) this.reader = original.getReader();
-      const { value, done } = await this.reader.read();
+      if (!reader) reader = original.getReader();
+      const { value, done } = await reader.read();
       if (done) controller.close();
       else controller.enqueue(value);
     },
     cancel(reason) {
-      try { this.reader?.cancel(reason); } catch {}
+      try { reader?.cancel(reason); } catch {}
     }
   });
-  return { ...socket, readable };
+  return {
+    readable,
+    writable: socket.writable,
+    opened: socket.opened,
+    closed: socket.closed,
+    close: () => socket.close?.()
+  };
 }
