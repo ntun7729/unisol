@@ -2,7 +2,7 @@ import { connect } from 'cloudflare:sockets';
 import { applyConnectionOverrides, buildConfig, routeKind, VERSION } from './core.js';
 import { handleWebSocket, handleXhttp } from './session.js';
 import { renderSubscription } from './subscription.js';
-import { loadStoredConfig, saveStoredConfig } from './store.js';
+import { loadStoredConfig, sanitizeStoredConfig, saveStoredConfig } from './store.js';
 import { adminPage, cafePage, configApiResponse, isAdminAuthorized } from './ui.js';
 
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
@@ -68,14 +68,12 @@ export default {
       if (route.kind === 'ws') {
         const upgrade = (request.headers.get('Upgrade') || '').toLowerCase();
         if (!config.enableWs || upgrade !== 'websocket') return new Response('Not Found', { status: 404 });
-        const connectionConfig = applyConnectionOverrides(config, url);
-        return handleWebSocket(request, connectionConfig, connect);
+        return handleWebSocket(request, applyConnectionOverrides(config, url), connect);
       }
 
       if (route.kind === 'xhttp') {
         if (!config.enableXhttp || request.method !== 'POST') return new Response('Not Found', { status: 404 });
-        const connectionConfig = applyConnectionOverrides(config, url);
-        return handleXhttp(request, connectionConfig, connect, ctx);
+        return handleXhttp(request, applyConnectionOverrides(config, url), connect, ctx);
       }
 
       return new Response('Not Found', { status: 404 });
@@ -112,9 +110,10 @@ async function handleConfigApi(request, env, config) {
   }
 
   try {
-    const saved = await saveStoredConfig(env, payload);
-    const next = buildConfig(env, saved);
+    const candidate = sanitizeStoredConfig(payload);
+    const next = buildConfig(env, candidate);
     if (!next.uuid) return json({ error: 'UUID must be a valid UUIDv4' }, 400);
+    await saveStoredConfig(env, candidate);
     return json(configApiResponse(next, true));
   } catch (error) {
     return json({ error: error?.message || 'failed to save configuration' }, 400);
