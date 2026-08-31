@@ -1,5 +1,5 @@
 import { concatBytes, isIpv6, isPrivateAddress, resolvePolicy } from './core.js';
-import { discoverCloudflareEdge, noteEdgeFailure, noteEdgeSuccess } from './adaptive.js';
+import { discoverCloudflareEdge } from './adaptive.js';
 import { encodeSocksAddress } from './protocol.js';
 
 const encoder = new TextEncoder();
@@ -52,35 +52,30 @@ async function openAdaptiveOutbound({ host, port, initialData, config, connector
   const directAttempt = { kind: 'direct', host, port, label: `direct:${host}:${port}` };
   const hasPayload = Boolean(initialData?.byteLength);
 
+  // Server-first or payload-less protocols cannot be judged by first byte safely.
+  // In that case, retain ordinary direct-connect semantics, then use configured
+  // ProxyIP/proxy fallbacks only if the TCP connection itself fails.
   if (!hasPayload) {
     try {
       return { socket: await openAttemptSocket(directAttempt, { host, port, initialData, config, connector }), route: directAttempt };
     } catch (error) {
       errors.push(`${directAttempt.label}: ${error?.message || error}`);
+      return openAdaptiveTail({ host, port, initialData, config, connector, errors });
     }
-
-    if (config.adaptiveEdge) {
-      const discovery = await discoverCloudflareEdge({ host, port, initialData, fetcher, edgeRace: config.edgeRace });
-      for (const candidate of discovery.candidates.slice(0, config.edgeRace)) {
-        const attempt = edgeAttempt(candidate, port);
-        try {
-          const socket = await openAttemptSocket(attempt, { host, port, initialData, config, connector });
-          noteEdgeSuccess(candidate.host);
-          return { socket, route: attempt };
-        } catch (error) {
-          noteEdgeFailure(candidate.host);
-          errors.push(`${attempt.label}: ${error?.message || error}`);
-        }
-      }
-    }
-
-    return openAdaptiveTail({ host, port, initialData, config, connector, errors });
   }
 
+  // Direct gets only the hedge window to prove it is responsive. Once that
+  // window expires we close it and move forward. This prevents ProxyIP/SOCKS
+  // from sitting behind a long-lived direct/edge race.
   let directSession = null;
   try {
     directSession = await startResponsiveAttempt(directAttempt, {
-      host, port, initialData, config, connector, timeoutMs: config.firstByteTimeoutMs
+      host,
+      port,
+      initialData,
+      config,
+      connector,
+      timeoutMs: Math.max(config.firstByteTimeoutMs, config.hedgeDelayMs)
     });
   } catch (error) {
     errors.push(`${directAttempt.label}: ${error?.message || error}`);
@@ -91,97 +86,76 @@ async function openAdaptiveOutbound({ host, port, initialData, config, connector
       directSession.response
         .then(socket => ({ type: 'success', socket }))
         .catch(error => ({ type: 'failure', error })),
-      delay(config.hedgeDelayMs).then(() => ({ type: 'hedge' }))
+      delay(config.hedgeDelayMs).then(() => ({ type: 'fallback' }))
     ]);
+
     if (early.type === 'success') return { socket: early.socket, route: directAttempt };
+
     if (early.type === 'failure') {
       errors.push(`${directAttempt.label}: ${early.error?.message || early.error}`);
-      directSession = null;
+    } else {
+      directSession.response.catch(() => {});
+      directSession.cancel('adaptive fallback');
+      errors.push(`${directAttempt.label}: no first byte within ${config.hedgeDelayMs}ms`);
     }
   }
 
-  let discovery = { eligible: false, candidates: [] };
+  // Cloudflare-specific bridge is intentionally ONE candidate only. No pool,
+  // no race. If Cloudflare's Worker runtime rejects the address or it does not
+  // respond quickly, continue immediately to user-configured ProxyIP/SOCKS.
   if (config.adaptiveEdge) {
-    discovery = await discoverCloudflareEdge({ host, port, initialData, fetcher, edgeRace: config.edgeRace });
-  }
-
-  if (discovery.eligible) {
-    const sessions = [];
-    const contenders = [];
-    let raceClosed = false;
-
-    if (directSession) {
-      sessions.push(directSession);
-      contenders.push(
-        directSession.response.then(socket => ({ socket, route: directAttempt, session: directSession }))
-      );
+    let discovery = { eligible: false, candidates: [] };
+    try {
+      discovery = await discoverCloudflareEdge({ host, port, initialData, fetcher });
+    } catch (error) {
+      errors.push(`edge-discovery: ${error?.message || error}`);
     }
 
-    for (const candidate of discovery.candidates.slice(0, config.edgeRace)) {
+    const candidate = discovery.candidates?.[0];
+    if (discovery.eligible && candidate) {
       const attempt = edgeAttempt(candidate, port);
-      contenders.push((async () => {
-        let session;
-        try {
-          session = await startResponsiveAttempt(attempt, {
-            host, port, initialData, config, connector, timeoutMs: config.edgeFirstByteTimeoutMs
-          });
-          sessions.push(session);
-          if (raceClosed) throw superseded(session);
-          const socket = await session.response;
-          if (raceClosed) throw superseded(session);
-          noteEdgeSuccess(candidate.host);
-          return { socket, route: attempt, session };
-        } catch (error) {
-          if (error?.code !== 'SUPERSEDED') noteEdgeFailure(candidate.host);
-          const wrapped = new Error(`${attempt.label}: ${error?.message || error}`);
-          if (error?.code === 'SUPERSEDED') wrapped.code = 'SUPERSEDED';
-          throw wrapped;
-        }
-      })());
-    }
-
-    if (contenders.length) {
       try {
-        const winner = await Promise.any(contenders);
-        raceClosed = true;
-        for (const session of sessions) if (session !== winner.session) session.cancel('superseded');
-        return { socket: winner.socket, route: winner.route, adaptive: { application: discovery.application, routeHost: discovery.routeHost } };
-      } catch (aggregate) {
-        raceClosed = true;
-        for (const session of sessions) session.cancel('superseded');
-        for (const error of aggregate?.errors || []) errors.push(error?.message || String(error));
-        directSession = null;
+        const socket = await openResponsiveOnce(attempt, {
+          host,
+          port,
+          initialData,
+          config,
+          connector,
+          timeoutMs: config.edgeFirstByteTimeoutMs
+        });
+        return {
+          socket,
+          route: attempt,
+          adaptive: { application: discovery.application, routeHost: discovery.routeHost }
+        };
+      } catch (error) {
+        errors.push(`${attempt.label}: ${error?.message || error}`);
       }
     }
-  } else if (directSession) {
-    try {
-      const socket = await directSession.response;
-      return { socket, route: directAttempt };
-    } catch (error) {
-      errors.push(`${directAttempt.label}: ${error?.message || error}`);
-      directSession = null;
-    }
   }
 
-  if (directSession) directSession.cancel('superseded');
   return openAdaptiveTail({ host, port, initialData, config, connector, errors });
-}
-
-function superseded(session) {
-  session?.response?.catch(() => {});
-  session?.cancel('superseded');
-  const error = new Error('superseded');
-  error.code = 'SUPERSEDED';
-  return error;
 }
 
 async function openAdaptiveTail({ host, port, initialData, config, connector, errors }) {
   for (let index = 0; index < (config.proxyIp || []).length; index++) {
     const item = config.proxyIp[index];
-    const attempt = { kind: 'proxyip', host: item.host, port: item.port || port, label: `proxyip#${index + 1}:${item.host}:${item.port || port}` };
+    const attempt = {
+      kind: 'proxyip',
+      host: item.host,
+      port: item.port || port,
+      label: `proxyip#${index + 1}:${item.host}:${item.port || port}`
+    };
     try {
       const socket = initialData?.byteLength
-        ? await openResponsiveOnce(attempt, { host, port, initialData, config, connector, timeoutMs: config.edgeFirstByteTimeoutMs })
+        ? await openResponsiveOnce(attempt, {
+            host,
+            port,
+            initialData,
+            config,
+            connector,
+            timeoutMs: config.edgeFirstByteTimeoutMs
+          })
         : await openAttemptSocket(attempt, { host, port, initialData, config, connector });
       return { socket, route: attempt };
     } catch (error) {
@@ -190,10 +164,22 @@ async function openAdaptiveTail({ host, port, initialData, config, connector, er
   }
 
   if (config.outbound) {
-    const attempt = { kind: 'proxy', host: config.outbound.host, port: config.outbound.port, label: `${config.outbound.scheme}:${config.outbound.host}:${config.outbound.port}` };
+    const attempt = {
+      kind: 'proxy',
+      host: config.outbound.host,
+      port: config.outbound.port,
+      label: `${config.outbound.scheme}:${config.outbound.host}:${config.outbound.port}`
+    };
     try {
       const socket = initialData?.byteLength
-        ? await openResponsiveOnce(attempt, { host, port, initialData, config, connector, timeoutMs: config.firstByteTimeoutMs })
+        ? await openResponsiveOnce(attempt, {
+            host,
+            port,
+            initialData,
+            config,
+            connector,
+            timeoutMs: config.firstByteTimeoutMs
+          })
         : await openAttemptSocket(attempt, { host, port, initialData, config, connector });
       return { socket, route: attempt };
     } catch (error) {
@@ -265,7 +251,6 @@ function firstByteGate(socket, timeoutMs) {
     }
     response.catch(() => {});
     const error = new Error(reason);
-    if (reason === 'superseded') error.code = 'SUPERSEDED';
     fail(error);
   }
 
