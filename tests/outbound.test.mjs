@@ -24,6 +24,7 @@ function scriptedSocket(onWrite) {
     opened: Promise.resolve({ remoteAddress: 'fake' }),
     closed: Promise.resolve(),
     close() { closed = true; try { controller.close(); } catch {} },
+    push(bytes) { if (!closed) controller.enqueue(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)); },
     writes,
     get wasClosed() { return closed; }
   };
@@ -34,6 +35,10 @@ async function readOne(stream) {
   const result = await reader.read();
   reader.releaseLock();
   return result.value;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function adaptiveConfig(overrides = {}) {
@@ -208,6 +213,32 @@ test('adaptive mode hedges a stalled Cloudflare destination through dynamically 
   assert.equal(direct.wasClosed, true);
   assert.deepEqual([...(await readOne(result.socket.readable))], [7,7]);
   assert.ok(addresses.some(address => /^104\./.test(address)));
+});
+
+test('adaptive mode closes an edge contender that finishes opening after direct already wins', async () => {
+  const direct = scriptedSocket(async () => []);
+  const edge = scriptedSocket(async () => []);
+  edge.opened = sleep(30).then(() => ({ remoteAddress: 'edge' }));
+  const connector = address => address.hostname === 'target.example' ? direct : edge;
+
+  const resultPromise = openOutbound({
+    host: 'target.example',
+    port: 443,
+    initialData: encoder.encode('GET / HTTP/1.1\r\nHost: target.example\r\n\r\n'),
+    config: adaptiveConfig({ hedgeDelayMs: 2, firstByteTimeoutMs: 120, edgeFirstByteTimeoutMs: 200 }),
+    connector,
+    fetcher: dnsFetcher({
+      'target.example': ['104.18.22.10'],
+      'www.cloudflare.com': ['104.16.123.96']
+    })
+  });
+
+  setTimeout(() => direct.push(new Uint8Array([3,2,1])), 12);
+  const result = await resultPromise;
+  assert.equal(result.route.kind, 'direct');
+  assert.deepEqual([...(await readOne(result.socket.readable))], [3,2,1]);
+  await sleep(45);
+  assert.equal(edge.wasClosed, true);
 });
 
 test('adaptive mode skips edge bridging for non-Cloudflare DNS and falls back to configured ProxyIP', async () => {
