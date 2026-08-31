@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  SINGLE_CF_EDGE_IP,
   clearAdaptiveState,
   discoverCloudflareEdge,
   extractHttpHost,
@@ -58,10 +59,11 @@ function tlsClientHello(host) {
   return record;
 }
 
-function dnsFetcher(map) {
+function dnsFetcher(map, seen = null) {
   return async url => {
     const parsed = new URL(url);
     const name = parsed.searchParams.get('name');
+    if (seen) seen.push(name);
     const addresses = map[name] || [];
     return new Response(JSON.stringify({
       Status: 0,
@@ -87,26 +89,24 @@ test('application sniffing extracts TLS SNI and plaintext HTTP Host', () => {
   assert.deepEqual(sniffApplicationHost(http, 'ignored.test'), { kind: 'http', host: 'cf.example' });
 });
 
-test('edge discovery classifies the actual application hostname and uses live anchor DNS', async () => {
+test('edge discovery returns exactly one fixed Cloudflare candidate', async () => {
   clearAdaptiveState();
-  const fetcher = dnsFetcher({
-    'site.example': ['104.18.22.10', '172.67.10.20'],
-    'www.cloudflare.com': ['104.16.123.96', '104.16.124.96']
-  });
+  const seen = [];
   const result = await discoverCloudflareEdge({
     host: 'site.example',
     port: 443,
     initialData: tlsClientHello('site.example'),
-    fetcher,
-    edgeRace: 2
+    fetcher: dnsFetcher({
+      'site.example': ['104.18.22.10', '172.67.10.20']
+    }, seen),
+    edgeRace: 4
   });
   assert.equal(result.eligible, true);
   assert.equal(result.application, 'tls');
   assert.equal(result.routeHost, 'site.example');
   assert.deepEqual(result.resolved, ['104.18.22.10', '172.67.10.20']);
-  assert.ok(result.candidates.length >= 2);
-  assert.ok(result.candidates.every(candidate => isCloudflareIpv4(candidate.host)));
-  assert.ok(result.candidates.some(candidate => candidate.source === 'anchor'));
+  assert.deepEqual(result.candidates, [{ host: SINGLE_CF_EDGE_IP, source: 'sg-preferred-anycast' }]);
+  assert.deepEqual(seen, ['site.example']);
 });
 
 test('edge discovery skips non-Cloudflare destinations', async () => {
@@ -115,8 +115,7 @@ test('edge discovery skips non-Cloudflare destinations', async () => {
     host: 'example.net',
     port: 443,
     initialData: tlsClientHello('example.net'),
-    fetcher: dnsFetcher({ 'example.net': ['93.184.216.34'] }),
-    edgeRace: 2
+    fetcher: dnsFetcher({ 'example.net': ['93.184.216.34'] })
   });
   assert.equal(result.eligible, false);
   assert.equal(result.reason, 'not-cloudflare');
