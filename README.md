@@ -1,8 +1,8 @@
 # Unisol
 
-Unisol is a modular Cloudflare Worker tunnel gateway built after studying the design patterns in [`cmliu/edgetunnel`](https://github.com/cmliu/edgetunnel) and [`byJoey/cfnew`](https://github.com/byJoey/cfnew). It is an independent implementation rather than a fork or a copied single-file source.
+Unisol is a modular Cloudflare Worker tunnel gateway built after studying useful design patterns in [`cmliu/edgetunnel`](https://github.com/cmliu/edgetunnel) and [`byJoey/cfnew`](https://github.com/byJoey/cfnew). It is an independent implementation rather than a fork or a copied single-file source.
 
-The project keeps the parts that are useful in production—bounded streaming, protocol-aware parsing, multiple outbound strategies, live KV configuration, and self-contained subscriptions—while separating them into small modules that can be tested independently.
+Version 0.2 adds an **adaptive egress** path designed for the common Worker problem where ordinary destinations respond normally but Cloudflare-fronted destinations can stall. It does not copy cfnew's fixed built-in fallback list: Unisol waits for evidence of a real stall, inspects the application hostname, classifies it with DNS-over-HTTPS, dynamically discovers current Cloudflare edge addresses, and races only the routes that make sense.
 
 ## What it supports
 
@@ -11,13 +11,18 @@ The project keeps the parts that are useful in production—bounded streaming, p
 - Trojan TCP over WebSocket
 - Trojan TCP over XHTTP
 - VLESS UDP DNS on port 53, translated to DNS-over-HTTPS
+- Adaptive direct/edge egress with first-byte health checks
+- TLS ClientHello SNI and HTTP Host inspection for routing only
+- Dynamic Cloudflare classification using DoH and Cloudflare's published IPv4 ranges
+- Dynamic edge candidates rather than a copied fixed ProxyIP pool
+- Per-isolate edge success scoring and failure cooldowns
 - Direct outbound TCP with configurable connection racing
-- ProxyIP/fallback destinations
+- Optional manual ProxyIP/fallback destinations
 - SOCKS5 outbound, with or without username/password
 - HTTP CONNECT outbound, with optional Basic authentication
 - HTTPS CONNECT outbound, with TLS on the Worker-to-proxy hop
 - Per-domain routing rules
-- `proxy-first`, `direct-first`, `proxy-only`, and `direct` outbound modes
+- `adaptive`, `proxy-first`, `direct-first`, `proxy-only`, and `direct` outbound modes
 - Optional IPv6-disable policy
 - Literal private/local destination filtering by default
 - Optional per-connection outbound overrides
@@ -30,8 +35,9 @@ The project keeps the parts that are useful in production—bounded streaming, p
 ```text
 src/index.js          HTTP routing / control plane
 src/core.js           config parsing, endpoints, policy, route matching
+src/adaptive.js       SNI/Host sniffing, DoH classification, edge scoring
 src/protocol.js       VLESS + Trojan wire protocol parsing
-src/outbound.js       direct, SOCKS5, HTTP CONNECT, HTTPS CONNECT
+src/outbound.js       adaptive/direct/SOCKS5/HTTP(S) CONNECT egress
 src/transport.js      bounded upload queue + stream aggregation
 src/session.js        WebSocket / XHTTP sessions + DNS framing
 src/subscription.js   node links + Clash / Sing-box generation
@@ -39,7 +45,45 @@ src/store.js          KV configuration cache and persistence
 src/ui.js             camouflage and admin pages
 ```
 
-This structure is intentional. The transport code does not need to know how a SOCKS5 handshake works, and the outbound code does not need to know whether the ingress was WebSocket or XHTTP.
+The transport code does not need to know how a SOCKS5 handshake works, and the adaptive classifier does not need to know whether ingress was WebSocket or XHTTP.
+
+## Adaptive egress
+
+`adaptive` is the default mode in v0.2.
+
+For a normal TCP request with initial application data, the sequence is:
+
+```text
+1. Open original destination directly
+2. Send the untouched client bytes
+3. If a response arrives before the hedge delay -> keep direct
+4. If it stalls -> inspect SNI / HTTP Host
+5. Resolve that application hostname with Cloudflare DoH
+6. Continue edge logic only if its A records are inside Cloudflare's published ranges
+7. Discover current edge candidates from live DNS and derive a target-range sibling candidate
+8. Race the still-pending direct socket against a small number of edge candidates
+9. First route that returns actual response bytes wins
+10. Close every losing and late-opening socket
+11. If all adaptive routes fail -> manual ProxyIP -> configured SOCKS/HTTP(S) proxy
+```
+
+A TCP socket being "opened" is not treated as proof that the route works. The adaptive path uses **first response byte** as the health signal and preserves that byte when handing the winning socket back to the tunnel session.
+
+### Why it differs from a fixed fallback list
+
+Unisol intentionally does not ship a copied set of ten or twenty Cloudflare addresses. Instead:
+
+- fast direct traffic incurs no DoH classification request;
+- only stalled traffic is classified;
+- non-Cloudflare destinations are not sprayed at Cloudflare addresses;
+- current edge candidates are obtained from live DNS;
+- Cloudflare ownership is checked against an embedded copy of the published IPv4 CIDR set;
+- a deterministic sibling candidate can be derived inside the target Cloudflare range;
+- failed edge candidates receive an isolate-local exponential cooldown;
+- successful candidates receive a small preference score;
+- candidate racing is bounded to avoid unnecessary sockets.
+
+This is still an opportunistic workaround, not a Cloudflare platform guarantee. See **Cloudflare platform constraints** below.
 
 ## Required configuration
 
@@ -49,30 +93,35 @@ The tunnel needs a valid UUIDv4. It can be supplied directly as a Worker variabl
 UUID=90cd4a77-141a-43c9-991b-08263cfe9c10
 ```
 
-Or, if you want to bootstrap through the admin interface, set `ADMIN`, bind KV, then use `/admin` to save the UUID. The fixed control-plane routes `/health`, `/admin`, and `/api/config` remain reachable before a UUID exists.
+Or set `ADMIN`, bind KV, open `/admin`, and save the UUID there. `/health`, `/admin`, and `/api/config` remain routable before a UUID exists.
 
-Recommended for the live admin interface:
+Recommended:
 
 ```text
 ADMIN=use-a-long-random-password
 ```
 
-Bind a Cloudflare KV namespace as `KV` if you want settings changed in `/admin` to persist.
+Bind a Cloudflare KV namespace as `KV` if settings changed through `/admin` should persist.
 
 ### Environment variables
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `UUID` | required for tunnel traffic | VLESS user and the base identity for the deployment; UUIDv4 only |
-| `ADMIN` | empty | Password used as a Bearer token by `/api/config`; enables `/admin` |
+| `UUID` | required for tunnel traffic | VLESS user and deployment identity; UUIDv4 only |
+| `ADMIN` | empty | Bearer-token password protecting `/api/config` |
 | `PATH` | first 8 UUID chars | Ingress/subscription path prefix |
 | `TROJAN_PASSWORD` | empty | Enables Trojan when set |
-| `OUTBOUND` | empty | `socks5://`, `http://`, or `https://` proxy URL; no scheme means SOCKS5 |
-| `MODE` | `proxy-first` | `proxy-first`, `direct-first`, `proxy-only`, or `direct` |
-| `PROXYIP` | empty | Comma/newline-separated fallback endpoints |
+| `OUTBOUND` | empty | Optional `socks5://`, `http://`, or `https://` final egress proxy |
+| `MODE` | `adaptive` | Global outbound policy |
+| `PROXYIP` | empty | Optional manual fallback endpoints |
 | `PREFERRED` | empty | Subscription edge endpoints, optionally with `#name` |
 | `ROUTES` | empty | Destination policy rules such as `*.example.com=proxy-only` |
-| `DIAL_RACE` | `2` | Number of parallel direct connection attempts, 1–4 |
+| `DIAL_RACE` | `2` | Parallel original-destination connect attempts, 1-4 |
+| `ADAPTIVE_EDGE` | `true` | Enable stalled Cloudflare edge discovery/hedging |
+| `HEDGE_DELAY` | `900` | Soft delay before classifying/launching adaptive contenders, ms |
+| `FIRST_BYTE_TIMEOUT` | `5000` | Direct/proxy response-byte deadline, ms |
+| `EDGE_FIRST_BYTE_TIMEOUT` | `3000` | Edge/ProxyIP response-byte deadline, ms |
+| `EDGE_RACE` | `2` | Maximum adaptive edge contenders, 1-4 |
 | `ENABLE_WS` | `true` | Enable WebSocket ingress |
 | `ENABLE_XHTTP` | `true` | Enable XHTTP ingress |
 | `BLOCK_PRIVATE` | `true` | Reject literal localhost/private/link-local targets and local names |
@@ -87,11 +136,66 @@ Bind a Cloudflare KV namespace as `KV` if you want settings changed in `/admin` 
 
 `BLOCK_PRIVATE` validates literal IPv4/IPv6 targets, IPv4-mapped IPv6 targets, localhost/local names, multicast, link-local, RFC1918, CGNAT, and IPv6 local ranges before dialing. It does not pre-resolve arbitrary DNS names, so it is not a DNS-rebinding firewall.
 
-Endpoint examples:
+## Outbound policies
+
+### `adaptive` - recommended default
+
+```text
+fast original direct
+  -> on stall: classified/dynamic Cloudflare edge race
+  -> manual ProxyIP fallbacks
+  -> configured SOCKS/HTTP(S) proxy
+```
+
+The external proxy is therefore a final escape path rather than a mandatory bottleneck.
+
+### `proxy-first`
+
+```text
+configured proxy -> original destination -> ProxyIP fallbacks
+```
+
+### `direct-first`
+
+```text
+original destination -> ProxyIP fallbacks -> configured proxy
+```
+
+### `proxy-only`
+
+Only the configured SOCKS/HTTP(S) proxy is allowed. There is no direct leak fallback.
+
+### `direct`
+
+Uses the original destination and optional manual ProxyIP fallbacks, but not the configured external proxy.
+
+### Domain routing
+
+`ROUTES` overrides the global mode for matching destinations:
+
+```text
+ROUTES=*.example.com=adaptive; api.example.net=direct; *.blocked.invalid=block
+```
+
+Supported route policies:
+
+```text
+adaptive
+proxy-first
+direct-first
+proxy-only
+direct
+block
+```
+
+A pattern beginning with `*.` matches subdomains but not the bare apex. `*` matches everything.
+
+## Optional manual fallback/proxy
+
+Adaptive mode does not require either one, but both are retained as later escape paths.
 
 ```text
 PROXYIP=proxy-a.example:443#SG, [2001:db8::10]:8443#v6
-PREFERRED=1.2.3.4:443#Fast, edge.example:8443#Domain
 ```
 
 Proxy examples:
@@ -103,86 +207,48 @@ OUTBOUND=http://user:pass@proxy.example:8080
 OUTBOUND=https://user:pass@proxy.example:443
 ```
 
-## Outbound policy
-
-The default is `proxy-first`:
-
-```text
-proxy -> original destination -> ProxyIP fallbacks
-```
-
-`direct-first` reverses the preference:
-
-```text
-original destination -> ProxyIP fallbacks -> proxy
-```
-
-`proxy-only` is the leak-resistant mode. If the configured outbound proxy fails, the connection fails instead of silently becoming direct.
-
-`direct` never uses the configured SOCKS/HTTP proxy, but can still try configured ProxyIP fallbacks.
-
-### Domain routing
-
-`ROUTES` overrides the global mode for matching destinations:
-
-```text
-ROUTES=*.example.com=proxy-only; api.example.net=direct; *.invalid=block
-```
-
-Supported policies are:
-
-```text
-proxy-first
-direct-first
-proxy-only
-direct
-block
-```
-
-A pattern beginning with `*.` matches subdomains but not the bare apex. `*` matches everything.
-
 ## Per-connection overrides
 
-They are disabled by default. If you explicitly set:
+Disabled by default. If you explicitly set:
 
 ```text
 ALLOW_PATH_OVERRIDE=true
 ```
 
-WebSocket and XHTTP requests can use these query parameters:
+WebSocket and XHTTP requests can use:
 
 ```text
 proxy=socks5://user:pass@host:1080
-mode=proxy-only
+mode=adaptive
 proxyip=fallback.example:443
 no6=1
 ```
 
-Example path:
+Example:
 
 ```text
-/<PATH>/ws?mode=proxy-only&proxy=socks5%3A%2F%2Fproxy.example%3A1080
+/<PATH>/ws?mode=adaptive
 ```
 
-Do not enable path overrides on a deployment where untrusted users know the ingress path unless you actually want them to select those policies.
+Do not enable path overrides where untrusted users know the ingress path unless you want them to select outbound policies.
 
-## Paths
+## Paths and subscriptions
 
 If `PATH=myedge`:
 
 | Path | Method | Purpose |
 |---|---|---|
 | `/` | GET | Cafe camouflage page |
-| `/health` | GET | Minimal JSON health/status response |
+| `/health` | GET | Minimal JSON status |
 | `/myedge` | WebSocket upgrade | WebSocket ingress alias |
 | `/myedge/ws` | WebSocket upgrade | WebSocket ingress |
 | `/myedge/xhttp` | POST | XHTTP ingress |
 | `/myedge/sub` | GET | Subscription |
 | `/sub/myedge` | GET | Subscription alias |
-| `/admin` | GET | Admin UI when `ADMIN` is configured |
+| `/admin` | GET | Admin UI; shows setup instructions if `ADMIN` is missing |
 | `/api/config` | GET/POST | Bearer-authenticated config API |
 
-Subscription format can be selected explicitly:
+Subscription formats:
 
 ```text
 /myedge/sub?format=base64
@@ -191,30 +257,37 @@ Subscription format can be selected explicitly:
 /myedge/sub?format=singbox
 ```
 
-Clash and Sing-box output currently includes the WebSocket nodes, because those formats have stable WebSocket support across common clients. Raw/Base64 output also contains XHTTP links.
+Clash and Sing-box output currently includes the WebSocket nodes. Raw/Base64 also contains XHTTP links.
+
+## Admin / KV
+
+The admin page now exposes adaptive controls directly:
+
+- Mode
+- Adaptive edge enable/disable
+- Hedge delay
+- Direct first-byte timeout
+- Edge first-byte timeout
+- Edge race count
+- manual ProxyIP
+- optional SOCKS/HTTP(S) proxy
+- routes, identity, transports, IPv6, and security switches
+
+`/admin` itself is always reachable. If `ADMIN` is not configured it presents setup instructions and keeps save/reload disabled. The actual `/api/config` remains locked until the Bearer credential is configured.
+
+The browser stores the password only in `sessionStorage`. `ADMIN` is never persisted to KV. KV configuration is cached in the Worker isolate for 30 seconds, and successful saves update the current isolate cache immediately.
+
+**Upgrade note:** if an existing deployment previously saved `MODE=proxy-only` or another mode in KV, updating the source does not overwrite that choice. Open `/admin`, choose `adaptive`, and save if you want the new behavior.
 
 ## DNS behavior
 
-VLESS UDP is accepted only for destination port 53. Its two-byte length-prefixed DNS packets are decoded and forwarded as DNS wire messages to:
+VLESS UDP is accepted only for destination port 53. Two-byte length-prefixed DNS packets are forwarded as DNS wire messages to:
 
 ```text
 https://1.1.1.1/dns-query
 ```
 
-Responses are converted back to VLESS UDP framing. Trojan UDP and non-DNS UDP are intentionally rejected instead of being incorrectly forwarded as TCP.
-
-## Admin / KV
-
-1. Create a Cloudflare KV namespace.
-2. Bind it to the Worker as `KV`.
-3. Set `ADMIN` to a strong value.
-4. Open `/admin`.
-5. Enter the admin password when prompted.
-6. Save a valid UUID and any other desired settings.
-
-The browser stores the password only in `sessionStorage` and sends it to `/api/config` in the `Authorization: Bearer ...` header. `ADMIN` itself is not writable through the KV API and is never included in the persisted configuration allowlist.
-
-KV configuration is cached in the Worker isolate for 30 seconds. A successful save updates the current isolate cache immediately. Admin POSTs behave as patches so omitted stored settings are preserved.
+Adaptive route classification separately uses Cloudflare's JSON DoH endpoint and caches A-record answers for a bounded period. Trojan UDP and non-DNS UDP are intentionally rejected.
 
 ## Deploy with Wrangler
 
@@ -223,78 +296,76 @@ npm install
 npx wrangler deploy
 ```
 
-For secrets, either configure variables in the Cloudflare dashboard or use Wrangler. For example:
+For secrets:
 
 ```bash
 npx wrangler secret put ADMIN
 ```
 
-`UUID` can be a normal Worker variable; it does not have to be a secret.
+The included `wrangler.toml` points to `src/index.js`. The standalone bundle is generated at:
 
-The included `wrangler.toml` points directly to `src/index.js`, so Wrangler can deploy the modular source tree without requiring the bundled artifact.
+```text
+dist/_worker.js
+```
 
-## Build and verify locally
+## Build and verification
 
 ```bash
 npm install
 npm run check
 ```
 
-`npm run check` runs the unit suite, builds the standalone Worker, and performs `wrangler deploy --dry-run` against the modular Worker source.
+`npm run check` runs unit tests, builds the standalone Worker, and performs a Wrangler deployment dry-run.
 
-The standalone bundle is written to:
+GitHub Actions also boots the Worker under local `wrangler dev`/workerd and smoke-tests control-plane behavior. The unit suite includes adaptive-specific tests for:
 
-```text
-dist/_worker.js
-```
-
-That file keeps `cloudflare:sockets` as a Worker runtime import and can be used for one-file deployment workflows.
-
-## GitHub Actions verification
-
-`.github/workflows/ci.yml` runs on pushes, pull requests, and manual dispatch. Superseded runs on the same ref are cancelled. The workflow:
-
-1. parses every source and test file with `node --check`;
-2. runs the Node unit tests;
-3. bundles the Worker with esbuild;
-4. runs a Cloudflare Wrangler deployment dry-run;
-5. boots the Worker under local `wrangler dev`/workerd and smoke-tests root, health, admin, authenticated/unauthenticated config API, subscription generation, and malformed XHTTP handling;
-6. verifies that the standalone output exists and retains the Cloudflare socket runtime import;
-7. uploads the built `_worker.js` as a workflow artifact.
-
-The unit suite covers configuration, bootstrap routing, KV persistence/sanitization, route matching, UUID/auth parsing, VLESS, Trojan/SHA-224, IPv4/IPv6 target handling, SOCKS5, HTTP CONNECT, HTTPS CONNECT, segmented proxy responses, bounded queueing, malformed stream headers, DNS framing/DoH, and subscription generation.
+- Cloudflare published-range classification;
+- TLS SNI extraction;
+- plaintext HTTP Host extraction;
+- dynamic DoH edge discovery;
+- skipping edge logic for non-Cloudflare destinations;
+- fast direct traffic making no classification request;
+- stalled Cloudflare traffic winning through a dynamically discovered edge route;
+- manual ProxyIP fallback for non-Cloudflare failures;
+- first-byte preservation;
+- closure of losing and late-opening hedge sockets.
 
 ## Security defaults
 
-Unisol intentionally defaults to a narrower security posture:
-
-- literal localhost, RFC1918, link-local, carrier-grade NAT, mapped-private IPv6, multicast, local names, and IPv6 local ranges are blocked as destinations;
-- connection-level outbound overrides are disabled;
+- literal localhost, RFC1918, link-local, carrier-grade NAT, mapped-private IPv6, multicast, local names, and IPv6 local ranges are blocked;
+- connection-level overrides are disabled;
 - `proxy-only` never falls back to direct;
+- adaptive edge routing is gated by destination classification and supported web ports;
+- candidate races are bounded;
+- failed candidates receive cooldowns instead of being hammered repeatedly;
 - admin writes require a Bearer token and KV binding;
-- admin credentials are never persisted to KV;
+- admin credentials are never persisted;
 - malformed protocol frames are rejected before outbound dialing;
 - WebSocket early data and upload buffers are bounded;
 - invalid UDP types are rejected rather than guessed.
 
-If you disable these protections, do it deliberately.
-
 ## Cloudflare platform constraints
 
-This is still a Cloudflare Worker, so Cloudflare runtime/network restrictions apply. In particular, Cloudflare documents that outbound TCP sockets to Cloudflare IP ranges are blocked. A `PROXYIP` therefore needs to be a destination that the Worker runtime is actually permitted to reach.
+Cloudflare documents that Workers outbound TCP sockets to Cloudflare IP ranges are blocked. Therefore the adaptive edge technique must be treated as **opportunistic behavior**, not a guaranteed or supported bypass of the platform rule. Runtime behavior can differ by deployment and can change without notice.
 
-Use the project only where you are authorized to operate the tunnel and comply with the Cloudflare terms and the laws applicable to your deployment.
+Unisol keeps manual ProxyIP and SOCKS/HTTP(S) egress precisely so there is still a conventional fallback when the adaptive edge route is unavailable. `proxy-only` remains the strict option when avoiding direct egress matters more than performance.
+
+Use the project only where you are authorized to operate the tunnel and comply with Cloudflare's terms and applicable law.
 
 ## Design relationship to the studied projects
 
-The two upstream projects demonstrated several useful engineering patterns: protocol multiplexing at the Worker edge, runtime-configurable outbound selection, fallback routing, optimized streaming, and subscription generation. Unisol applies those ideas with a different internal design:
+The upstream projects demonstrated useful patterns such as protocol multiplexing, fallback routing, optimized streaming, proxy egress, and subscription generation. Unisol v0.2 deliberately diverges in several ways:
 
-- multiple testable modules instead of one very large source file;
-- explicit routing policy objects rather than transport-specific global state;
-- one outbound interface shared by WS and XHTTP;
-- generic SOCKS/HTTP(S) proxy handshakes with preserved buffered bytes;
-- strict literal-target filtering before dial;
-- dedicated DNS framing rather than treating UDP payloads as TCP;
-- CI that validates unit behavior, Cloudflare bundling, and a local Workers runtime smoke path.
+- modular, independently testable source instead of one large Worker file;
+- a shared outbound interface for WS and XHTTP;
+- adaptive first-byte hedging instead of treating `socket.opened` as success;
+- live DoH classification before Cloudflare-specific fallback;
+- live edge discovery instead of copying a fixed upstream address pool;
+- SNI/Host inspection to avoid relying only on the VLESS/Trojan requested hostname;
+- per-isolate candidate scoring and exponential cooldown;
+- explicit cleanup of losing and late-opening race sockets;
+- conventional ProxyIP/SOCKS/HTTP(S) fallback retained after adaptive attempts;
+- strict target filtering and dedicated DNS framing;
+- CI that validates unit behavior, bundle compatibility, and local Workers runtime behavior.
 
-The goal is not to reproduce either upstream project feature-for-feature. It is to provide a smaller foundation that is easier to reason about and extend safely.
+The goal is not to reproduce either upstream project feature-for-feature. It is to build a smaller foundation that can evolve independently and be reasoned about under failure.
