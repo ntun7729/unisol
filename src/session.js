@@ -1,4 +1,5 @@
-import { concatBytes } from './core.js';
+import { concatBytes, resolvePolicy } from './core.js';
+import { isEdgeEligiblePort } from './adaptive.js';
 import { decodeEarlyData, parseInbound } from './protocol.js';
 import { closeQuietly, openOutbound } from './outbound.js';
 import { CoalescingWriter, GrainSender, pipeReaderToWritable, readProtocolHead, responseReadable } from './transport.js';
@@ -17,6 +18,7 @@ export async function handleWebSocket(request, config, connector) {
   let remote = null;
   let upload = null;
   let dnsFramer = null;
+  let awaitingTcpPayload = false;
   let stopped = false;
   let chain = Promise.resolve();
 
@@ -97,11 +99,25 @@ export async function handleWebSocket(request, config, connector) {
       if (result.status !== 'ok') throw new Error(result.error || 'invalid protocol request');
       parsed = result;
       input = new Uint8Array(0);
+      if (shouldDeferAdaptiveTcp(parsed, config)) {
+        awaitingTcpPayload = true;
+        return;
+      }
       await startRemote(parsed);
       return;
     }
-    if (parsed.udp) await processDnsChunk(bytes);
-    else await upload.push(bytes);
+    if (parsed.udp) {
+      await processDnsChunk(bytes);
+      return;
+    }
+    if (awaitingTcpPayload) {
+      if (!bytes.byteLength) return;
+      awaitingTcpPayload = false;
+      parsed = { ...parsed, payload: bytes };
+      await startRemote(parsed);
+      return;
+    }
+    await upload.push(bytes);
   };
 
   server.addEventListener('message', event => {
@@ -130,12 +146,20 @@ export async function handleXhttp(request, config, connector, ctx) {
 
   if (head.parsed.udp) return dnsXhttpResponse(reader, head.parsed, ctx);
 
+  let initialData;
+  try {
+    initialData = await readInitialApplicationData(reader, head.parsed, config);
+  } catch (error) {
+    try { reader.releaseLock(); } catch {}
+    return new Response(error?.message || 'Invalid request body', { status: 400 });
+  }
+
   let result;
   try {
     result = await openOutbound({
       host: head.parsed.host,
       port: head.parsed.port,
-      initialData: head.parsed.payload,
+      initialData,
       config,
       connector
     });
@@ -157,6 +181,22 @@ export async function handleXhttp(request, config, connector, ctx) {
     status: 200,
     headers: streamHeaders(padding)
   });
+}
+
+export function shouldDeferAdaptiveTcp(parsed, config) {
+  if (!parsed || parsed.udp || parsed.payload?.byteLength) return false;
+  if (!config?.adaptiveEdge || !isEdgeEligiblePort(parsed.port)) return false;
+  return resolvePolicy(parsed.host, config) === 'adaptive';
+}
+
+export async function readInitialApplicationData(reader, parsed, config) {
+  if (!shouldDeferAdaptiveTcp(parsed, config)) return parsed.payload || new Uint8Array(0);
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return new Uint8Array(0);
+    const bytes = toBytes(value);
+    if (bytes.byteLength) return bytes;
+  }
 }
 
 function dnsXhttpResponse(reader, parsed, ctx) {
