@@ -1,5 +1,6 @@
 import { connect } from 'cloudflare:sockets';
 import { applyConnectionOverrides, buildConfig, normalizePolicy, routeKind, VERSION } from './core.js';
+import { createRequestConnector, hasRequestFetcher } from './request-connector.js';
 import { handleWebSocket, handleXhttp } from './session.js';
 import { renderSubscription } from './subscription.js';
 import { loadStoredConfig, sanitizeStoredConfig, saveStoredConfig } from './store.js';
@@ -33,6 +34,7 @@ export default {
           configured: Boolean(config.uuid),
           adminConfigured: Boolean(config.admin),
           kv: Boolean(env?.KV && typeof env.KV.get === 'function'),
+          requestFetcher: hasRequestFetcher(request),
           ws: config.enableWs,
           xhttp: config.enableXhttp
         });
@@ -69,14 +71,16 @@ export default {
         if (!config.enableWs || upgrade !== 'websocket') return new Response('Not Found', { status: 404 });
         const connectionConfig = applyConnectionOverrides(config, url);
         if (connectionConfig.outboundRaw && !connectionConfig.outbound) return new Response('Invalid outbound proxy', { status: 400 });
-        return handleWebSocket(request, connectionConfig, connect);
+        const connector = createRequestConnector(request, connect);
+        return handleWebSocket(request, connectionConfig, connector);
       }
 
       if (route.kind === 'xhttp') {
         if (!config.enableXhttp || request.method !== 'POST') return new Response('Not Found', { status: 404 });
         const connectionConfig = applyConnectionOverrides(config, url);
         if (connectionConfig.outboundRaw && !connectionConfig.outbound) return new Response('Invalid outbound proxy', { status: 400 });
-        return handleXhttp(request, connectionConfig, connect, ctx);
+        const connector = createRequestConnector(request, connect);
+        return handleXhttp(request, connectionConfig, connector, ctx);
       }
 
       return new Response('Not Found', { status: 404 });
