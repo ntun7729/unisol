@@ -49,6 +49,14 @@ jobs:
       - name: Local Workers runtime smoke test
         shell: bash
         run: |
+          cleanup() {
+            if [ -n "${WRANGLER_PID:-}" ]; then
+              kill "$WRANGLER_PID" 2>/dev/null || true
+              wait "$WRANGLER_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
           cat > .dev.vars <<'EOF'
           UUID="90cd4a77-141a-43c9-991b-08263cfe9c10"
           ADMIN="ci-admin"
@@ -56,11 +64,6 @@ jobs:
 
           npx wrangler dev --ip 127.0.0.1 --port 8787 --local-protocol https > /tmp/unisol-wrangler.log 2>&1 &
           WRANGLER_PID=$!
-          cleanup() {
-            kill "$WRANGLER_PID" 2>/dev/null || true
-            wait "$WRANGLER_PID" 2>/dev/null || true
-          }
-          trap cleanup EXIT
 
           ready=0
           for _ in $(seq 1 80); do
@@ -77,6 +80,7 @@ jobs:
 
           grep -q '"ok": true' /tmp/unisol-health.json
           grep -q '"configured": true' /tmp/unisol-health.json
+          grep -q '"adminConfigured": true' /tmp/unisol-health.json
           curl -kfsS https://127.0.0.1:8787/ | grep -q 'Unisol Coffee'
           curl -kfsS https://127.0.0.1:8787/admin | grep -q 'Unisol Admin'
 
@@ -93,6 +97,37 @@ jobs:
           test "$code" = "400"
 
           cleanup
+          WRANGLER_PID=''
+
+          cat > .dev.vars <<'EOF'
+          UUID="90cd4a77-141a-43c9-991b-08263cfe9c10"
+          EOF
+
+          npx wrangler dev --ip 127.0.0.1 --port 8788 --local-protocol https > /tmp/unisol-wrangler-no-admin.log 2>&1 &
+          WRANGLER_PID=$!
+
+          ready=0
+          for _ in $(seq 1 80); do
+            if curl -kfsS https://127.0.0.1:8788/health > /tmp/unisol-health-no-admin.json 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$ready" != "1" ]; then
+            cat /tmp/unisol-wrangler-no-admin.log
+            exit 1
+          fi
+
+          grep -q '"adminConfigured": false' /tmp/unisol-health-no-admin.json
+          curl -kfsS https://127.0.0.1:8788/admin > /tmp/unisol-admin-no-admin.html
+          grep -q 'Unisol Admin' /tmp/unisol-admin-no-admin.html
+          grep -q 'ADMIN is not configured' /tmp/unisol-admin-no-admin.html
+          code=$(curl -ksS -o /tmp/unisol-no-admin-api.txt -w '%{http_code}' https://127.0.0.1:8788/api/config)
+          test "$code" = "401"
+
+          cleanup
+          WRANGLER_PID=''
           trap - EXIT
 
       - name: Verify bundle
