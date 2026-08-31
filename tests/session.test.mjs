@@ -1,8 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DnsFramer, frameDns, queryDns } from '../src/session.js';
+import { DnsFramer, frameDns, queryDns, readInitialApplicationData, shouldDeferAdaptiveTcp } from '../src/session.js';
 
 function bytes(...values) { return new Uint8Array(values); }
+
+function adaptiveConfig(overrides = {}) {
+  return {
+    mode: 'adaptive',
+    routes: [],
+    adaptiveEdge: true,
+    ...overrides
+  };
+}
 
 test('DnsFramer reconstructs split VLESS UDP frames', () => {
   const framer = new DnsFramer();
@@ -39,4 +48,40 @@ test('queryDns sends DNS wire format via DoH and returns response bytes', async 
 
 test('queryDns rejects failed upstream responses', async () => {
   await assert.rejects(() => queryDns(bytes(1), async () => new Response('no', { status: 503 })), /DNS upstream failed/);
+});
+
+test('adaptive web TCP waits for application bytes when protocol header has no payload', () => {
+  const parsed = { host: 'site.example', port: 443, udp: false, payload: new Uint8Array(0) };
+  assert.equal(shouldDeferAdaptiveTcp(parsed, adaptiveConfig()), true);
+  assert.equal(shouldDeferAdaptiveTcp({ ...parsed, port: 22 }, adaptiveConfig()), false);
+  assert.equal(shouldDeferAdaptiveTcp({ ...parsed, payload: bytes(1) }, adaptiveConfig()), false);
+  assert.equal(shouldDeferAdaptiveTcp(parsed, adaptiveConfig({ adaptiveEdge: false })), false);
+  assert.equal(shouldDeferAdaptiveTcp(parsed, adaptiveConfig({ mode: 'direct' })), false);
+});
+
+test('route-specific adaptive policy can defer even when global mode is direct', () => {
+  const parsed = { host: 'cf.example', port: 443, udp: false, payload: new Uint8Array(0) };
+  const config = adaptiveConfig({
+    mode: 'direct',
+    routes: [{ pattern: 'cf.example', policy: 'adaptive' }]
+  });
+  assert.equal(shouldDeferAdaptiveTcp(parsed, config), true);
+});
+
+test('readInitialApplicationData consumes the next non-empty streamed chunk for adaptive XHTTP', async () => {
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(0));
+      controller.enqueue(bytes(0x16, 0x03, 0x01, 0x00, 0x05));
+      controller.enqueue(bytes(9, 8));
+      controller.close();
+    }
+  });
+  const reader = stream.getReader();
+  const parsed = { host: 'site.example', port: 443, udp: false, payload: new Uint8Array(0) };
+  const first = await readInitialApplicationData(reader, parsed, adaptiveConfig());
+  assert.deepEqual([...first], [0x16, 0x03, 0x01, 0x00, 0x05]);
+  const remaining = await reader.read();
+  assert.deepEqual([...remaining.value], [9, 8]);
+  reader.releaseLock();
 });
