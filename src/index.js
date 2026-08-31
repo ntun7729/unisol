@@ -31,6 +31,7 @@ export default {
           ok: true,
           version: VERSION,
           configured: Boolean(config.uuid),
+          adminConfigured: Boolean(config.admin),
           kv: Boolean(env?.KV && typeof env.KV.get === 'function'),
           ws: config.enableWs,
           xhttp: config.enableXhttp
@@ -38,8 +39,7 @@ export default {
       }
 
       if (route.kind === 'admin' && request.method === 'GET') {
-        if (!config.admin) return new Response('Not Found', { status: 404 });
-        return html(adminPage(), { 'Cache-Control': 'no-store' });
+        return html(adminPage(Boolean(config.admin)), { 'Cache-Control': 'no-store' });
       }
 
       if (route.kind === 'config-api') return handleConfigApi(request, env, config, stored);
