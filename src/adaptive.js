@@ -4,9 +4,10 @@ const DOH_URL = 'https://cloudflare-dns.com/dns-query';
 const CACHE_MS = 5 * 60 * 1000;
 
 // Cloudflare CDN addresses are Anycast. This is intentionally ONE fixed edge
-// address so adaptive mode never fans out across a pool. The label is a routing
-// preference only; Cloudflare decides the actual PoP reached by Anycast.
-export const SINGLE_CF_EDGE_IP = '104.18.22.10';
+// address so adaptive mode never fans out across a pool. The address is from
+// cfnew's current tested official-direct set and its /24 is commonly geolocated
+// to Singapore, but Cloudflare Anycast still decides the actual PoP reached.
+export const SINGLE_CF_EDGE_IP = '162.158.189.134';
 
 export const CLOUDFLARE_IPV4_CIDRS = Object.freeze([
   '173.245.48.0/20',
