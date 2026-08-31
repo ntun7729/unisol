@@ -1,9 +1,12 @@
 import { isIpv4 } from './core.js';
 
 const DOH_URL = 'https://cloudflare-dns.com/dns-query';
-const EDGE_ANCHOR = 'www.cloudflare.com';
 const CACHE_MS = 5 * 60 * 1000;
-const HEALTH_LIMIT = 96;
+
+// Cloudflare CDN addresses are Anycast. This is intentionally ONE fixed edge
+// address so adaptive mode never fans out across a pool. The label is a routing
+// preference only; Cloudflare decides the actual PoP reached by Anycast.
+export const SINGLE_CF_EDGE_IP = '104.18.22.10';
 
 export const CLOUDFLARE_IPV4_CIDRS = Object.freeze([
   '173.245.48.0/20',
@@ -25,7 +28,6 @@ export const CLOUDFLARE_IPV4_CIDRS = Object.freeze([
 
 const parsedCidrs = CLOUDFLARE_IPV4_CIDRS.map(parseCidr).filter(Boolean);
 const dnsCache = new Map();
-const health = new Map();
 
 export function isCloudflareIpv4(ip) {
   const value = ipv4ToInt(ip);
@@ -114,8 +116,9 @@ export function isEdgeEligiblePort(port) {
   return new Set([80, 443, 2052, 2053, 2082, 2083, 2086, 2087, 2095, 2096, 8080, 8443, 8880]).has(Number(port));
 }
 
-export async function discoverCloudflareEdge({ host, port, initialData, fetcher = fetch, edgeRace = 2 }) {
+export async function discoverCloudflareEdge({ host, port, initialData, fetcher = fetch }) {
   if (!isEdgeEligiblePort(port)) return { eligible: false, reason: 'unsupported-port', candidates: [] };
+
   const app = sniffApplicationHost(initialData, host);
   const routeHost = app.host || normalizeHost(host);
   if (!routeHost) return { eligible: false, reason: 'missing-host', candidates: [] };
@@ -126,73 +129,27 @@ export async function discoverCloudflareEdge({ host, port, initialData, fetcher 
   else return { eligible: false, reason: 'unsupported-host', candidates: [] };
 
   const targetCloudflare = targetAddresses.filter(isCloudflareIpv4);
-  if (!targetCloudflare.length) return { eligible: false, reason: 'not-cloudflare', application: app.kind, routeHost, candidates: [] };
-
-  const anchorAddresses = (await resolveA(EDGE_ANCHOR, fetcher)).filter(isCloudflareIpv4);
-  const rawCandidates = [];
-  for (const ip of anchorAddresses) rawCandidates.push({ host: ip, source: 'anchor' });
-  for (const ip of targetCloudflare) {
-    const sibling = siblingAddress(ip, stableHash(`${routeHost}|${ip}`));
-    if (sibling && sibling !== ip) rawCandidates.push({ host: sibling, source: 'sibling' });
-    rawCandidates.push({ host: ip, source: 'target-dns' });
+  if (!targetCloudflare.length) {
+    return { eligible: false, reason: 'not-cloudflare', application: app.kind, routeHost, resolved: [], candidates: [] };
   }
 
-  const unique = [];
-  const seen = new Set();
-  for (const item of rawCandidates) {
-    if (!isCloudflareIpv4(item.host) || seen.has(item.host)) continue;
-    seen.add(item.host);
-    unique.push(item);
-  }
-
-  const ranked = rankCandidates(unique).slice(0, Math.max(1, Math.min(4, Number(edgeRace) || 2)) * 2);
   return {
-    eligible: ranked.length > 0,
-    reason: ranked.length ? 'cloudflare' : 'no-candidates',
+    eligible: true,
+    reason: 'cloudflare',
     application: app.kind,
     routeHost,
     resolved: targetCloudflare,
-    candidates: ranked
+    candidates: [{ host: SINGLE_CF_EDGE_IP, source: 'sg-preferred-anycast' }]
   };
 }
 
-export function rankCandidates(candidates, now = Date.now()) {
-  return candidates
-    .map((candidate, index) => {
-      const state = health.get(candidate.host) || { failures: 0, successes: 0, cooldownUntil: 0, touched: 0 };
-      const cooling = state.cooldownUntil > now;
-      const score = (cooling ? 10_000 + state.cooldownUntil - now : 0) + state.failures * 100 - state.successes * 25 + index;
-      return { ...candidate, score, cooling };
-    })
-    .sort((a, b) => a.score - b.score)
-    .map(({ score, cooling, ...candidate }) => candidate);
-}
-
-export function noteEdgeSuccess(host) {
-  const now = Date.now();
-  const state = health.get(host) || { failures: 0, successes: 0, cooldownUntil: 0, touched: 0 };
-  state.successes = Math.min(20, state.successes + 1);
-  state.failures = Math.max(0, state.failures - 1);
-  state.cooldownUntil = 0;
-  state.touched = now;
-  health.set(host, state);
-  trimHealth();
-}
-
-export function noteEdgeFailure(host) {
-  const now = Date.now();
-  const state = health.get(host) || { failures: 0, successes: 0, cooldownUntil: 0, touched: 0 };
-  state.failures = Math.min(8, state.failures + 1);
-  state.successes = Math.max(0, state.successes - 1);
-  state.cooldownUntil = now + Math.min(60_000, 1_500 * (2 ** Math.max(0, state.failures - 1)));
-  state.touched = now;
-  health.set(host, state);
-  trimHealth();
-}
+// Retained for compatibility with older tests/imports. Adaptive v0.2.1 no longer
+// maintains an edge pool or health ranking because only one fixed candidate exists.
+export function noteEdgeSuccess() {}
+export function noteEdgeFailure() {}
 
 export function clearAdaptiveState() {
   dnsCache.clear();
-  health.clear();
 }
 
 async function resolveA(host, fetcher) {
@@ -238,24 +195,6 @@ function ipv4ToInt(ip) {
   return String(ip).split('.').reduce((value, part) => ((value << 8) | Number(part)) >>> 0, 0);
 }
 
-function siblingAddress(ip, hash) {
-  if (!isIpv4(ip)) return '';
-  const parts = ip.split('.').map(Number);
-  let last = 1 + (hash % 253);
-  if (last === parts[3]) last = (last % 253) + 1;
-  parts[3] = last;
-  return parts.join('.');
-}
-
-function stableHash(text) {
-  let hash = 2166136261;
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
-}
-
 function normalizeHost(value) {
   return String(value || '').trim().toLowerCase().replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '');
 }
@@ -275,10 +214,4 @@ function isHostname(host) {
   const text = normalizeHost(host);
   if (!text || isIpv4(text) || text.includes(':') || text.length > 253) return false;
   return text.split('.').every(label => label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
-}
-
-function trimHealth() {
-  if (health.size <= HEALTH_LIMIT) return;
-  const oldest = [...health.entries()].sort((a, b) => a[1].touched - b[1].touched).slice(0, health.size - HEALTH_LIMIT);
-  for (const [key] of oldest) health.delete(key);
 }
