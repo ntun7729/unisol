@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { SINGLE_CF_EDGE_IP } from '../src/adaptive.js';
 import { buildAttempts, formatAuthority, httpConnect, openOutbound, socks5Connect } from '../src/outbound.js';
 
 const encoder = new TextEncoder();
@@ -35,10 +36,6 @@ async function readOne(stream) {
   const result = await reader.read();
   reader.releaseLock();
   return result.value;
-}
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function adaptiveConfig(overrides = {}) {
@@ -173,7 +170,7 @@ test('openOutbound closes a failed direct socket before trying fallback', async 
   assert.deepEqual([...good.writes[0]], [1,2,3]);
 });
 
-test('adaptive mode returns fast direct traffic without a DNS classification request', async () => {
+test('adaptive mode returns fast direct traffic without DNS classification', async () => {
   const direct = scriptedSocket((_chunk, n) => n === 1 ? [new Uint8Array([9,8,7])] : []);
   const counter = { count: 0 };
   const result = await openOutbound({
@@ -189,7 +186,7 @@ test('adaptive mode returns fast direct traffic without a DNS classification req
   assert.deepEqual([...(await readOne(result.socket.readable))], [9,8,7]);
 });
 
-test('adaptive mode hedges a stalled Cloudflare destination through dynamically discovered edge IPs', async () => {
+test('adaptive mode uses only the single fixed Cloudflare edge candidate', async () => {
   const direct = scriptedSocket(async () => []);
   const edge = scriptedSocket((_chunk, n) => n === 1 ? [new Uint8Array([7,7])] : []);
   const addresses = [];
@@ -201,47 +198,43 @@ test('adaptive mode hedges a stalled Cloudflare destination through dynamically 
     host: 'target.example',
     port: 443,
     initialData: encoder.encode('GET / HTTP/1.1\r\nHost: target.example\r\n\r\n'),
-    config: adaptiveConfig(),
+    config: adaptiveConfig({ edgeRace: 4 }),
     connector,
-    fetcher: dnsFetcher({
-      'target.example': ['104.18.22.10'],
-      'www.cloudflare.com': ['104.16.123.96']
-    })
+    fetcher: dnsFetcher({ 'target.example': ['104.18.22.10'] })
   });
   assert.equal(result.route.kind, 'edge');
-  assert.notEqual(result.route.host, 'target.example');
+  assert.equal(result.route.host, SINGLE_CF_EDGE_IP);
   assert.equal(direct.wasClosed, true);
+  assert.deepEqual(addresses, ['target.example', SINGLE_CF_EDGE_IP]);
   assert.deepEqual([...(await readOne(result.socket.readable))], [7,7]);
-  assert.ok(addresses.some(address => /^104\./.test(address)));
 });
 
-test('adaptive mode closes an edge contender that finishes opening after direct already wins', async () => {
+test('adaptive Cloudflare edge failure immediately falls through to ProxyIP', async () => {
   const direct = scriptedSocket(async () => []);
-  const edge = scriptedSocket(async () => []);
-  edge.opened = sleep(30).then(() => ({ remoteAddress: 'edge' }));
-  const connector = address => address.hostname === 'target.example' ? direct : edge;
-
-  const resultPromise = openOutbound({
+  const fallback = scriptedSocket((_chunk, n) => n === 1 ? [new Uint8Array([5])] : []);
+  const addresses = [];
+  const connector = address => {
+    addresses.push(address.hostname);
+    if (address.hostname === 'target.example') return direct;
+    if (address.hostname === SINGLE_CF_EDGE_IP) throw new Error('Cloudflare edge blocked by runtime');
+    if (address.hostname === 'fallback.example') return fallback;
+    throw new Error(`unexpected ${address.hostname}`);
+  };
+  const result = await openOutbound({
     host: 'target.example',
     port: 443,
     initialData: encoder.encode('GET / HTTP/1.1\r\nHost: target.example\r\n\r\n'),
-    config: adaptiveConfig({ hedgeDelayMs: 2, firstByteTimeoutMs: 120, edgeFirstByteTimeoutMs: 200 }),
+    config: adaptiveConfig({ proxyIp: [{ host: 'fallback.example', port: 443 }] }),
     connector,
-    fetcher: dnsFetcher({
-      'target.example': ['104.18.22.10'],
-      'www.cloudflare.com': ['104.16.123.96']
-    })
+    fetcher: dnsFetcher({ 'target.example': ['104.18.22.10'] })
   });
-
-  setTimeout(() => direct.push(new Uint8Array([3,2,1])), 12);
-  const result = await resultPromise;
-  assert.equal(result.route.kind, 'direct');
-  assert.deepEqual([...(await readOne(result.socket.readable))], [3,2,1]);
-  await sleep(45);
-  assert.equal(edge.wasClosed, true);
+  assert.equal(result.route.kind, 'proxyip');
+  assert.equal(result.route.host, 'fallback.example');
+  assert.deepEqual(addresses, ['target.example', SINGLE_CF_EDGE_IP, 'fallback.example']);
+  assert.deepEqual([...(await readOne(result.socket.readable))], [5]);
 });
 
-test('adaptive mode skips edge bridging for non-Cloudflare DNS and falls back to configured ProxyIP', async () => {
+test('adaptive mode skips fixed edge for non-Cloudflare DNS and falls back to ProxyIP', async () => {
   const direct = scriptedSocket(async () => []);
   const fallback = scriptedSocket((_chunk, n) => n === 1 ? [new Uint8Array([5])] : []);
   const addresses = [];
@@ -253,7 +246,7 @@ test('adaptive mode skips edge bridging for non-Cloudflare DNS and falls back to
     host: 'ordinary.example',
     port: 443,
     initialData: encoder.encode('GET / HTTP/1.1\r\nHost: ordinary.example\r\n\r\n'),
-    config: adaptiveConfig({ proxyIp: [{ host: 'fallback.example', port: 443 }], firstByteTimeoutMs: 25 }),
+    config: adaptiveConfig({ proxyIp: [{ host: 'fallback.example', port: 443 }] }),
     connector,
     fetcher: dnsFetcher({ 'ordinary.example': ['93.184.216.34'] })
   });
@@ -261,6 +254,39 @@ test('adaptive mode skips edge bridging for non-Cloudflare DNS and falls back to
   assert.equal(result.route.host, 'fallback.example');
   assert.deepEqual([...(await readOne(result.socket.readable))], [5]);
   assert.deepEqual(addresses, ['ordinary.example', 'fallback.example']);
+});
+
+test('adaptive mode can fall through to configured SOCKS5 outbound', async () => {
+  const direct = scriptedSocket(async () => []);
+  const proxy = scriptedSocket((_chunk, n) => {
+    if (n === 1) return [new Uint8Array([5,0])];
+    if (n === 2) return [new Uint8Array([5,0,0,1,127,0,0,1,0,1])];
+    if (n === 3) return [new Uint8Array([9])];
+    return [];
+  });
+  const addresses = [];
+  const connector = address => {
+    addresses.push(address.hostname);
+    if (address.hostname === 'target.example') return direct;
+    if (address.hostname === 'proxy.example') return proxy;
+    throw new Error(`unexpected ${address.hostname}`);
+  };
+
+  const result = await openOutbound({
+    host: 'target.example',
+    port: 443,
+    initialData: encoder.encode('GET / HTTP/1.1\r\nHost: target.example\r\n\r\n'),
+    config: adaptiveConfig({
+      adaptiveEdge: false,
+      outbound: { scheme: 'socks5', host: 'proxy.example', port: 1080, username: '', password: '' }
+    }),
+    connector
+  });
+
+  assert.equal(result.route.kind, 'proxy');
+  assert.equal(result.route.host, 'proxy.example');
+  assert.deepEqual(addresses, ['target.example', 'proxy.example']);
+  assert.deepEqual([...(await readOne(result.socket.readable))], [9]);
 });
 
 test('IPv6 HTTP CONNECT authority is bracketed', () => {
