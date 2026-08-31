@@ -1,49 +1,259 @@
 import { concatBytes, isIpv6, isPrivateAddress, resolvePolicy } from './core.js';
+import { discoverCloudflareEdge, noteEdgeFailure, noteEdgeSuccess } from './adaptive.js';
 import { encodeSocksAddress } from './protocol.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-export async function openOutbound({ host, port, initialData = new Uint8Array(0), config, connector }) {
+export async function openOutbound({ host, port, initialData = new Uint8Array(0), config, connector, fetcher = fetch }) {
   if (!connector) throw new Error('connector is required');
   if (config.disableIpv6 && isIpv6(host)) throw new Error('IPv6 destination disabled');
   if (config.blockPrivate && isPrivateAddress(host)) throw new Error('private destination blocked');
 
   const policy = resolvePolicy(host, config);
   if (policy === 'block') throw new Error('destination blocked by route policy');
+  if (policy === 'adaptive') {
+    return openAdaptiveOutbound({ host, port, initialData, config, connector, fetcher });
+  }
+
   const attempts = buildAttempts(host, port, config, policy);
   if (!attempts.length) throw new Error('no outbound route available');
+  return openOrderedAttempts({ host, port, initialData, config, connector, attempts });
+}
 
+export function buildAttempts(host, port, config, policy = resolvePolicy(host, config)) {
+  const direct = [{ kind: 'direct', host, port, label: `direct:${host}:${port}` }];
+  const fallback = (config.proxyIp || []).map((item, index) => ({
+    kind: 'proxyip', host: item.host, port: item.port || port, label: `proxyip#${index + 1}:${item.host}:${item.port || port}`
+  }));
+  const proxy = config.outbound ? [{ kind: 'proxy', host: config.outbound.host, port: config.outbound.port, label: `${config.outbound.scheme}:${config.outbound.host}:${config.outbound.port}` }] : [];
+
+  if (policy === 'direct') return [...direct, ...fallback];
+  if (policy === 'proxy-only') return proxy;
+  if (policy === 'direct-first' || policy === 'adaptive') return [...direct, ...fallback, ...proxy];
+  return [...proxy, ...direct, ...fallback];
+}
+
+async function openOrderedAttempts({ host, port, initialData, config, connector, attempts }) {
   const errors = [];
   for (const attempt of attempts) {
-    let socket;
     try {
-      if (attempt.kind === 'proxy') {
-        socket = await connectViaProxy(connector, config.outbound, host, port, initialData);
-      } else {
-        socket = await connectDirect(connector, attempt.host, attempt.port, config.dialRace);
-        await writeInitial(socket, initialData);
-      }
+      const socket = await openAttemptSocket(attempt, { host, port, initialData, config, connector });
       return { socket, route: attempt };
     } catch (error) {
-      closeQuietly(socket);
       errors.push(`${attempt.label}: ${error?.message || error}`);
     }
   }
   throw new Error(`all outbound attempts failed: ${errors.join(' | ')}`);
 }
 
-export function buildAttempts(host, port, config, policy = resolvePolicy(host, config)) {
-  const direct = [{ kind: 'direct', host, port, label: `direct:${host}:${port}` }];
-  const fallback = (config.proxyIp || []).map((item, index) => ({
-    kind: 'direct', host: item.host, port: item.port || port, label: `proxyip#${index + 1}:${item.host}:${item.port || port}`
-  }));
-  const proxy = config.outbound ? [{ kind: 'proxy', host: config.outbound.host, port: config.outbound.port, label: `${config.outbound.scheme}:${config.outbound.host}:${config.outbound.port}` }] : [];
+async function openAdaptiveOutbound({ host, port, initialData, config, connector, fetcher }) {
+  const errors = [];
+  const directAttempt = { kind: 'direct', host, port, label: `direct:${host}:${port}` };
+  const hasPayload = Boolean(initialData?.byteLength);
 
-  if (policy === 'direct') return [...direct, ...fallback];
-  if (policy === 'proxy-only') return proxy;
-  if (policy === 'direct-first') return [...direct, ...fallback, ...proxy];
-  return [...proxy, ...direct, ...fallback];
+  if (!hasPayload) {
+    try {
+      return { socket: await openAttemptSocket(directAttempt, { host, port, initialData, config, connector }), route: directAttempt };
+    } catch (error) {
+      errors.push(`${directAttempt.label}: ${error?.message || error}`);
+    }
+
+    if (config.adaptiveEdge) {
+      const discovery = await discoverCloudflareEdge({ host, port, initialData, fetcher, edgeRace: config.edgeRace });
+      for (const candidate of discovery.candidates.slice(0, config.edgeRace)) {
+        const attempt = edgeAttempt(candidate, port);
+        try {
+          const socket = await openAttemptSocket(attempt, { host, port, initialData, config, connector });
+          noteEdgeSuccess(candidate.host);
+          return { socket, route: attempt };
+        } catch (error) {
+          noteEdgeFailure(candidate.host);
+          errors.push(`${attempt.label}: ${error?.message || error}`);
+        }
+      }
+    }
+
+    return openAdaptiveTail({ host, port, initialData, config, connector, errors });
+  }
+
+  let directSession = null;
+  try {
+    directSession = await startResponsiveAttempt(directAttempt, {
+      host, port, initialData, config, connector, timeoutMs: config.firstByteTimeoutMs
+    });
+  } catch (error) {
+    errors.push(`${directAttempt.label}: ${error?.message || error}`);
+  }
+
+  if (directSession) {
+    const early = await Promise.race([
+      directSession.response
+        .then(socket => ({ type: 'success', socket }))
+        .catch(error => ({ type: 'failure', error })),
+      delay(config.hedgeDelayMs).then(() => ({ type: 'hedge' }))
+    ]);
+    if (early.type === 'success') return { socket: early.socket, route: directAttempt };
+    if (early.type === 'failure') {
+      errors.push(`${directAttempt.label}: ${early.error?.message || early.error}`);
+      directSession = null;
+    }
+  }
+
+  let discovery = { eligible: false, candidates: [] };
+  if (config.adaptiveEdge) {
+    discovery = await discoverCloudflareEdge({ host, port, initialData, fetcher, edgeRace: config.edgeRace });
+  }
+
+  if (discovery.eligible) {
+    const sessions = [];
+    const contenders = [];
+
+    if (directSession) {
+      sessions.push(directSession);
+      contenders.push(
+        directSession.response.then(socket => ({ socket, route: directAttempt, session: directSession }))
+      );
+    }
+
+    for (const candidate of discovery.candidates.slice(0, config.edgeRace)) {
+      const attempt = edgeAttempt(candidate, port);
+      contenders.push((async () => {
+        let session;
+        try {
+          session = await startResponsiveAttempt(attempt, {
+            host, port, initialData, config, connector, timeoutMs: config.edgeFirstByteTimeoutMs
+          });
+          sessions.push(session);
+          const socket = await session.response;
+          noteEdgeSuccess(candidate.host);
+          return { socket, route: attempt, session };
+        } catch (error) {
+          if (error?.code !== 'SUPERSEDED') noteEdgeFailure(candidate.host);
+          throw new Error(`${attempt.label}: ${error?.message || error}`);
+        }
+      })());
+    }
+
+    if (contenders.length) {
+      try {
+        const winner = await Promise.any(contenders);
+        for (const session of sessions) if (session !== winner.session) session.cancel('superseded');
+        return { socket: winner.socket, route: winner.route, adaptive: { application: discovery.application, routeHost: discovery.routeHost } };
+      } catch (aggregate) {
+        for (const session of sessions) session.cancel('superseded');
+        for (const error of aggregate?.errors || []) errors.push(error?.message || String(error));
+        directSession = null;
+      }
+    }
+  } else if (directSession) {
+    try {
+      const socket = await directSession.response;
+      return { socket, route: directAttempt };
+    } catch (error) {
+      errors.push(`${directAttempt.label}: ${error?.message || error}`);
+      directSession = null;
+    }
+  }
+
+  if (directSession) directSession.cancel('superseded');
+  return openAdaptiveTail({ host, port, initialData, config, connector, errors });
+}
+
+async function openAdaptiveTail({ host, port, initialData, config, connector, errors }) {
+  for (let index = 0; index < (config.proxyIp || []).length; index++) {
+    const item = config.proxyIp[index];
+    const attempt = { kind: 'proxyip', host: item.host, port: item.port || port, label: `proxyip#${index + 1}:${item.host}:${item.port || port}` };
+    try {
+      const socket = initialData?.byteLength
+        ? await openResponsiveOnce(attempt, { host, port, initialData, config, connector, timeoutMs: config.edgeFirstByteTimeoutMs })
+        : await openAttemptSocket(attempt, { host, port, initialData, config, connector });
+      return { socket, route: attempt };
+    } catch (error) {
+      errors.push(`${attempt.label}: ${error?.message || error}`);
+    }
+  }
+
+  if (config.outbound) {
+    const attempt = { kind: 'proxy', host: config.outbound.host, port: config.outbound.port, label: `${config.outbound.scheme}:${config.outbound.host}:${config.outbound.port}` };
+    try {
+      const socket = initialData?.byteLength
+        ? await openResponsiveOnce(attempt, { host, port, initialData, config, connector, timeoutMs: config.firstByteTimeoutMs })
+        : await openAttemptSocket(attempt, { host, port, initialData, config, connector });
+      return { socket, route: attempt };
+    } catch (error) {
+      errors.push(`${attempt.label}: ${error?.message || error}`);
+    }
+  }
+
+  throw new Error(`all adaptive outbound attempts failed: ${errors.join(' | ')}`);
+}
+
+function edgeAttempt(candidate, port) {
+  return { kind: 'edge', host: candidate.host, port, label: `edge-${candidate.source}:${candidate.host}:${port}` };
+}
+
+async function openResponsiveOnce(attempt, options) {
+  const session = await startResponsiveAttempt(attempt, options);
+  return session.response;
+}
+
+async function startResponsiveAttempt(attempt, { host, port, initialData, config, connector, timeoutMs }) {
+  const socket = await openAttemptSocket(attempt, { host, port, initialData, config, connector });
+  const gate = firstByteGate(socket, timeoutMs);
+  return {
+    attempt,
+    socket,
+    response: gate.response,
+    cancel: gate.cancel
+  };
+}
+
+function firstByteGate(socket, timeoutMs) {
+  const reader = socket.readable.getReader();
+  let settled = false;
+  let resultSocket = null;
+  let rejectResponse;
+  let timer;
+
+  const response = new Promise((resolve, reject) => {
+    rejectResponse = reject;
+    timer = setTimeout(() => fail(new Error(`first-byte timeout after ${timeoutMs}ms`), reject), timeoutMs);
+    reader.read().then(({ value, done }) => {
+      if (settled) return;
+      if (done || !value?.byteLength) {
+        fail(new Error('remote closed before first byte'), reject);
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      try { reader.releaseLock(); } catch {}
+      resultSocket = wrapReadablePrefix(socket, value);
+      resolve(resultSocket);
+    }).catch(error => fail(error, reject));
+  });
+
+  function fail(error, reject = rejectResponse) {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    try { reader.cancel(error).catch(() => {}); } catch {}
+    try { reader.releaseLock(); } catch {}
+    closeQuietly(socket);
+    reject?.(error);
+  }
+
+  function cancel(reason = 'cancelled') {
+    if (settled) {
+      closeQuietly(resultSocket || socket);
+      return;
+    }
+    const error = new Error(reason);
+    if (reason === 'superseded') error.code = 'SUPERSEDED';
+    fail(error);
+  }
+
+  return { response, cancel };
 }
 
 export async function connectDirect(connector, host, port, raceCount = 1) {
@@ -62,6 +272,22 @@ export async function connectDirect(connector, host, port, raceCount = 1) {
         }).catch(() => {});
       }
     }
+  }
+}
+
+async function openAttemptSocket(attempt, { host, port, initialData, config, connector }) {
+  let socket;
+  try {
+    if (attempt.kind === 'proxy') {
+      return await connectViaProxy(connector, config.outbound, host, port, initialData);
+    }
+    const race = attempt.kind === 'direct' ? config.dialRace : 1;
+    socket = await connectDirect(connector, attempt.host, attempt.port, race);
+    await writeInitial(socket, initialData);
+    return socket;
+  } catch (error) {
+    closeQuietly(socket);
+    throw error;
   }
 }
 
@@ -137,7 +363,7 @@ export async function httpConnect(connector, proxy, host, port, initialData = ne
       `CONNECT ${authority} HTTP/1.1`,
       `Host: ${authority}`,
       'Proxy-Connection: keep-alive',
-      'User-Agent: Unisol/1'
+      'User-Agent: Unisol/2'
     ];
     if (proxy.username) lines.push(`Proxy-Authorization: Basic ${base64Utf8(`${proxy.username}:${proxy.password || ''}`)}`);
     lines.push('', '');
@@ -163,6 +389,10 @@ async function writeInitial(socket, initialData) {
   const writer = socket.writable.getWriter();
   try { await writer.write(initialData); }
   finally { try { writer.releaseLock(); } catch {} }
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
 function base64Utf8(value) {
