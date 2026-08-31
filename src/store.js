@@ -30,7 +30,8 @@ export function sanitizeStoredConfig(input) {
   const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const allowed = [
     'uuid','path','trojanPassword','outbound','mode','proxyIp','preferred','routes',
-    'dialRace','enableWs','enableXhttp','blockPrivate','disableIpv6','allowPathOverride',
+    'dialRace','hedgeDelayMs','firstByteTimeoutMs','edgeFirstByteTimeoutMs','edgeRace','adaptiveEdge',
+    'enableWs','enableXhttp','blockPrivate','disableIpv6','allowPathOverride',
     'rootMode','subscriptionName','maxEarlyDataBytes','uploadCoalesceBytes','uploadQueueBytes','downloadGrainBytes'
   ];
   const out = {};
