@@ -168,6 +168,7 @@ async function openAdaptiveOutbound({ host, port, initialData, config, connector
 }
 
 function superseded(session) {
+  session?.response?.catch(() => {});
   session?.cancel('superseded');
   const error = new Error('superseded');
   error.code = 'SUPERSEDED';
@@ -262,6 +263,7 @@ function firstByteGate(socket, timeoutMs) {
       closeQuietly(resultSocket || socket);
       return;
     }
+    response.catch(() => {});
     const error = new Error(reason);
     if (reason === 'superseded') error.code = 'SUPERSEDED';
     fail(error);
