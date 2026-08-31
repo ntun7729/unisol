@@ -108,6 +108,7 @@ async function openAdaptiveOutbound({ host, port, initialData, config, connector
   if (discovery.eligible) {
     const sessions = [];
     const contenders = [];
+    let raceClosed = false;
 
     if (directSession) {
       sessions.push(directSession);
@@ -125,12 +126,16 @@ async function openAdaptiveOutbound({ host, port, initialData, config, connector
             host, port, initialData, config, connector, timeoutMs: config.edgeFirstByteTimeoutMs
           });
           sessions.push(session);
+          if (raceClosed) throw superseded(session);
           const socket = await session.response;
+          if (raceClosed) throw superseded(session);
           noteEdgeSuccess(candidate.host);
           return { socket, route: attempt, session };
         } catch (error) {
           if (error?.code !== 'SUPERSEDED') noteEdgeFailure(candidate.host);
-          throw new Error(`${attempt.label}: ${error?.message || error}`);
+          const wrapped = new Error(`${attempt.label}: ${error?.message || error}`);
+          if (error?.code === 'SUPERSEDED') wrapped.code = 'SUPERSEDED';
+          throw wrapped;
         }
       })());
     }
@@ -138,9 +143,11 @@ async function openAdaptiveOutbound({ host, port, initialData, config, connector
     if (contenders.length) {
       try {
         const winner = await Promise.any(contenders);
+        raceClosed = true;
         for (const session of sessions) if (session !== winner.session) session.cancel('superseded');
         return { socket: winner.socket, route: winner.route, adaptive: { application: discovery.application, routeHost: discovery.routeHost } };
       } catch (aggregate) {
+        raceClosed = true;
         for (const session of sessions) session.cancel('superseded');
         for (const error of aggregate?.errors || []) errors.push(error?.message || String(error));
         directSession = null;
@@ -158,6 +165,13 @@ async function openAdaptiveOutbound({ host, port, initialData, config, connector
 
   if (directSession) directSession.cancel('superseded');
   return openAdaptiveTail({ host, port, initialData, config, connector, errors });
+}
+
+function superseded(session) {
+  session?.cancel('superseded');
+  const error = new Error('superseded');
+  error.code = 'SUPERSEDED';
+  return error;
 }
 
 async function openAdaptiveTail({ host, port, initialData, config, connector, errors }) {
