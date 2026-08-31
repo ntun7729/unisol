@@ -1,8 +1,13 @@
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 
 export const DEFAULTS = Object.freeze({
-  mode: 'proxy-first',
+  mode: 'adaptive',
   dialRace: 2,
+  hedgeDelayMs: 900,
+  firstByteTimeoutMs: 5000,
+  edgeFirstByteTimeoutMs: 3000,
+  edgeRace: 2,
+  adaptiveEdge: true,
   maxEarlyDataBytes: 8192,
   uploadCoalesceBytes: 16 * 1024,
   uploadQueueBytes: 4 * 1024 * 1024,
@@ -163,7 +168,9 @@ function normalizeRoute(route) {
 export function normalizePolicy(value) {
   const text = String(value || '').trim().toLowerCase();
   const aliases = {
-    auto: 'proxy-first',
+    auto: 'adaptive',
+    adaptive: 'adaptive',
+    smart: 'adaptive',
     proxy: 'proxy-first',
     'proxy-first': 'proxy-first',
     direct: 'direct',
@@ -270,6 +277,11 @@ export function buildConfig(env = {}, stored = {}) {
     preferred: parsePreferredList(stored.preferred ?? stored.PREFERRED ?? env.PREFERRED ?? ''),
     routes: parseRoutes(stored.routes ?? stored.ROUTES ?? env.ROUTES ?? ''),
     dialRace: intValue(stored.dialRace ?? env.DIAL_RACE, DEFAULTS.dialRace, 1, 4),
+    hedgeDelayMs: intValue(stored.hedgeDelayMs ?? env.HEDGE_DELAY, DEFAULTS.hedgeDelayMs, 100, 5000),
+    firstByteTimeoutMs: intValue(stored.firstByteTimeoutMs ?? env.FIRST_BYTE_TIMEOUT, DEFAULTS.firstByteTimeoutMs, 1000, 15000),
+    edgeFirstByteTimeoutMs: intValue(stored.edgeFirstByteTimeoutMs ?? env.EDGE_FIRST_BYTE_TIMEOUT, DEFAULTS.edgeFirstByteTimeoutMs, 750, 10000),
+    edgeRace: intValue(stored.edgeRace ?? env.EDGE_RACE, DEFAULTS.edgeRace, 1, 4),
+    adaptiveEdge: boolValue(stored.adaptiveEdge ?? env.ADAPTIVE_EDGE, DEFAULTS.adaptiveEdge),
     maxEarlyDataBytes: intValue(stored.maxEarlyDataBytes ?? env.MAX_EARLY_DATA, DEFAULTS.maxEarlyDataBytes, 0, 16384),
     uploadCoalesceBytes: intValue(stored.uploadCoalesceBytes ?? env.UPLOAD_COALESCE, DEFAULTS.uploadCoalesceBytes, 1024, 65536),
     uploadQueueBytes: intValue(stored.uploadQueueBytes ?? env.UPLOAD_QUEUE, DEFAULTS.uploadQueueBytes, 64 * 1024, 16 * 1024 * 1024),
@@ -324,6 +336,11 @@ export function safeConfigView(config) {
     preferred: config.preferred,
     routes: config.routes,
     dialRace: config.dialRace,
+    hedgeDelayMs: config.hedgeDelayMs,
+    firstByteTimeoutMs: config.firstByteTimeoutMs,
+    edgeFirstByteTimeoutMs: config.edgeFirstByteTimeoutMs,
+    edgeRace: config.edgeRace,
+    adaptiveEdge: config.adaptiveEdge,
     enableWs: config.enableWs,
     enableXhttp: config.enableXhttp,
     blockPrivate: config.blockPrivate,
